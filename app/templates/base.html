@@ -13,7 +13,31 @@
 </head>
 <body>
   <nav>
-    <span class="nav-brand">Finance Tracker</span>
+    <span class="nav-brand">
+      {% if current_user is defined and current_user %}Hi there, {{ current_user.display_name or current_user.email.split('@')[0] }}{% else %}Finance Tracker{% endif %}
+    </span>
+    <div class="nav-links">
+      <a href="/dashboard" {% if request.url.path in ['/', '/dashboard'] %}class="active"{% endif %}>Dashboard</a>
+      <a href="/upload" {% if request.url.path.startswith('/upload') %}class="active"{% endif %}>Upload</a>
+      <a href="/review" {% if request.url.path.startswith('/review') %}class="active"{% endif %}>Review</a>
+      <a href="/transactions" {% if request.url.path.startswith('/transactions') %}class="active"{% endif %}>Transactions</a>
+      <a href="/balances" {% if request.url.path.startswith('/balances') %}class="active"{% endif %}>Balances</a>
+      <a href="/portfolio" {% if request.url.path.startswith('/portfolio') %}class="active"{% endif %}>Portfolio</a>
+    </div>
+    <div class="nav-end">
+      {% if current_user is defined and current_user %}
+      <a href="/logout" class="btn-signout">Sign out</a>
+      {% endif %}
+      <button class="nav-hamburger" id="nav-toggle" aria-label="Toggle menu">
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor">
+          <rect y="3" width="20" height="2" rx="1"/>
+          <rect y="9" width="20" height="2" rx="1"/>
+          <rect y="15" width="20" height="2" rx="1"/>
+        </svg>
+      </button>
+    </div>
+  </nav>
+  <div class="nav-mobile-menu" id="nav-mobile-menu">
     <a href="/dashboard" {% if request.url.path in ['/', '/dashboard'] %}class="active"{% endif %}>Dashboard</a>
     <a href="/upload" {% if request.url.path.startswith('/upload') %}class="active"{% endif %}>Upload</a>
     <a href="/review" {% if request.url.path.startswith('/review') %}class="active"{% endif %}>Review</a>
@@ -21,10 +45,9 @@
     <a href="/balances" {% if request.url.path.startswith('/balances') %}class="active"{% endif %}>Balances</a>
     <a href="/portfolio" {% if request.url.path.startswith('/portfolio') %}class="active"{% endif %}>Portfolio</a>
     {% if current_user is defined and current_user %}
-    <span class="nav-user">{{ current_user.display_name or current_user.email }}</span>
-    <a href="/logout" class="nav-logout">Sign out</a>
+    <a href="/logout" class="btn-signout mobile-signout">Sign out</a>
     {% endif %}
-  </nav>
+  </div>
   <main class="{% block main_class %}{% endblock %}">
     {% block content %}{% endblock %}
   </main>
