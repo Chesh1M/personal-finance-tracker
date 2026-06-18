@@ -18,11 +18,11 @@ depends_on: Union[str, Sequence[str], None] = None
 def upgrade() -> None:
     op.execute(
         "INSERT INTO categories (name, display_name, is_transfer) "
-        "VALUES ('fun_money', 'Fun Money', 0)"
+        "VALUES ('fun_money', 'Fun Money', false)"
     )
     op.execute(
         "INSERT INTO categories (name, display_name, is_transfer) "
-        "VALUES ('groceries', 'Groceries', 0)"
+        "VALUES ('groceries', 'Groceries', false)"
     )
 
 

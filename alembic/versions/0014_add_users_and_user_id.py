@@ -46,7 +46,7 @@ def upgrade() -> None:
     # ── Seed local dev user (id=1) ────────────────────────────────────────
     op.execute(
         "INSERT INTO users (google_id, email, display_name, created_at, last_login_at) "
-        "VALUES ('local_dev', 'local@dev', 'Local Dev', datetime('now'), datetime('now'))"
+        "VALUES ('local_dev', 'local@dev', 'Local Dev', NOW(), NOW())"
     )
 
     # ── statement_uploads: add user_id ────────────────────────────────────

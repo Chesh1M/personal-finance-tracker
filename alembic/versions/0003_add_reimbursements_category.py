@@ -19,7 +19,7 @@ depends_on: Union[str, Sequence[str], None] = None
 def upgrade() -> None:
     op.execute(
         "INSERT INTO categories (name, display_name, is_transfer) "
-        "VALUES ('reimbursements', 'Reimbursements', 0)"
+        "VALUES ('reimbursements', 'Reimbursements', false)"
     )
 
 
