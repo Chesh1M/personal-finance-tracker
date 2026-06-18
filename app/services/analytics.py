@@ -8,7 +8,7 @@ No python-dateutil: month arithmetic uses the calendar stdlib.
 import calendar
 from datetime import date
 
-from sqlalchemy import func
+from sqlalchemy import extract, func
 from sqlalchemy.orm import Session, aliased
 
 from app.models import Category, StatementUpload, Transaction
@@ -84,8 +84,8 @@ def get_available_months(db: Session, user_id: int) -> list[tuple[int, int]]:
     sorted descending (most recent first). Returns [] if no data."""
     rows = (
         db.query(
-            func.strftime("%Y", Transaction.date).label("yr"),
-            func.strftime("%m", Transaction.date).label("mo"),
+            extract("year", Transaction.date).label("yr"),
+            extract("month", Transaction.date).label("mo"),
         )
         .filter(
             Transaction.is_reviewed == True,  # noqa: E712
