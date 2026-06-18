@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "PowerShell(Set-Location \"g:\\\\My Drive\\\\AowenC - Backup\\\\Code\\\\ML & Data Science projects\\\\Personal Finance Tracker\"; $env:VIRTUAL_ENV = \\(Resolve-Path \".venv\"\\).Path; $env:PATH = \"$env:VIRTUAL_ENV\\\\Scripts;$env:PATH\"; alembic upgrade head)",
-      "Bash(venv\\\\Scripts\\\\pip install *)"
-    ]
-  }
-}
