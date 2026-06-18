@@ -13,9 +13,9 @@
 </head>
 <body>
   <nav>
-    <span class="nav-brand">
+    <a href="/dashboard" class="nav-brand">
       {% if current_user is defined and current_user %}Hi there, {{ current_user.display_name or current_user.email.split('@')[0] }}{% else %}Finance Tracker{% endif %}
-    </span>
+    </a>
     <div class="nav-links">
       <a href="/dashboard" {% if request.url.path in ['/', '/dashboard'] %}class="active"{% endif %}>Dashboard</a>
       <a href="/upload" {% if request.url.path.startswith('/upload') %}class="active"{% endif %}>Upload</a>
@@ -44,9 +44,6 @@
     <a href="/transactions" {% if request.url.path.startswith('/transactions') %}class="active"{% endif %}>Transactions</a>
     <a href="/balances" {% if request.url.path.startswith('/balances') %}class="active"{% endif %}>Balances</a>
     <a href="/portfolio" {% if request.url.path.startswith('/portfolio') %}class="active"{% endif %}>Portfolio</a>
-    {% if current_user is defined and current_user %}
-    <a href="/logout" class="btn-signout mobile-signout">Sign out</a>
-    {% endif %}
   </div>
   <main class="{% block main_class %}{% endblock %}">
     {% block content %}{% endblock %}
