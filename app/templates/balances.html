@@ -1,0 +1,157 @@
+{% extends "base.html" %}
+{% block title %}Account Balances — Finance Tracker{% endblock %}
+{% block main_class %}wide{% endblock %}
+
+{% block content %}
+
+<div class="page-header" style="margin-bottom: 1.25rem;">
+  <h1>Account Balances</h1>
+  <p class="subtitle">
+    Closing balance per statement period — edit inline or use AI extraction.
+    Balances appear on the Dashboard when a month is selected.
+  </p>
+</div>
+
+{% if statements %}
+<div class="card" style="padding: 0; overflow: hidden;">
+  <div class="table-scroll">
+    <table class="tx-table">
+      <thead>
+        <tr>
+          <th>Bank / Source</th>
+          <th>Account Type</th>
+          <th>Period</th>
+          <th>Closing Balance</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in statements %}
+        <tr data-sid="{{ s.id }}">
+
+          {# Bank name #}
+          <td style="font-weight:500;">{{ s.bank_source }}</td>
+
+          {# Account type — editable dropdown #}
+          <td>
+            <select class="filter-input acct-type-select"
+                    data-sid="{{ s.id }}"
+                    style="font-size:0.8rem; padding:0.25rem 0.5rem; min-width:120px;">
+              <option value="">— select —</option>
+              {% for at in account_types %}
+              <option value="{{ at }}" {% if s.account_type == at %}selected{% endif %}>
+                {{ at | replace('_', ' ') | title }}
+              </option>
+              {% endfor %}
+            </select>
+          </td>
+
+          {# Period (min–max tx date for this statement) #}
+          <td class="tx-date" style="white-space:nowrap;">
+            {% if s.period_start and s.period_end %}
+              {% if s.period_start.year == s.period_end.year and s.period_start.month == s.period_end.month %}
+                {{ s.period_start.strftime('%d') }}–{{ s.period_end.strftime('%d %b %Y') }}
+              {% else %}
+                {{ s.period_start.strftime('%d %b') }}–{{ s.period_end.strftime('%d %b %Y') }}
+              {% endif %}
+            {% else %}
+              <span style="color:var(--text-muted);">—</span>
+            {% endif %}
+          </td>
+
+          {# Closing balance — editable number input #}
+          <td>
+            <input type="number"
+                   step="0.01"
+                   min="0"
+                   class="filter-input balance-input"
+                   data-sid="{{ s.id }}"
+                   value="{{ '%.2f'|format(s.closing_balance) if s.closing_balance is not none else '' }}"
+                   placeholder="0.00"
+                   style="font-family:'IBM Plex Mono',monospace; font-size:0.83rem;
+                          width:130px; padding:0.25rem 0.5rem; text-align:right;" />
+          </td>
+
+          {# AI extract button #}
+          <td>
+            <form method="post" action="/statements/{{ s.id }}/extract-balance"
+                  title="Re-run AI to extract closing balance from stored statement text">
+              <button type="submit" class="btn btn-ghost"
+                      style="font-size:0.75rem; padding:0.25rem 0.65rem; white-space:nowrap;">
+                ✦ Extract (AI)
+              </button>
+            </form>
+          </td>
+
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% else %}
+<div class="card" style="text-align:center; padding:3rem;">
+  <p style="color:var(--text-muted);">No completed statements yet.</p>
+  <a href="/upload" class="btn btn-primary" style="margin-top:1rem; display:inline-flex;">Upload Statement</a>
+</div>
+{% endif %}
+
+{# ── AJAX: save account_type + closing_balance on change/blur ──────────── #}
+<script>
+(function () {
+  async function saveField(statementId, payload) {
+    const body = new FormData();
+    body.set('statement_id', statementId);
+    for (const [k, v] of Object.entries(payload)) body.set(k, v);
+    try {
+      const res = await fetch('/balances/update', {
+        method: 'POST',
+        headers: { 'X-Requested-With': 'XMLHttpRequest' },
+        body,
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  function flash(el, ok) {
+    const color = ok ? 'var(--success)' : 'var(--danger)';
+    el.style.transition = 'border-color 0.2s';
+    el.style.borderColor = color;
+    setTimeout(() => { el.style.borderColor = ''; }, 1000);
+  }
+
+  // Account type dropdown
+  document.querySelectorAll('.acct-type-select').forEach(sel => {
+    sel.addEventListener('change', async function () {
+      const ok = await saveField(this.dataset.sid, { account_type: this.value });
+      flash(this, ok);
+    });
+  });
+
+  // Extract (AI) button loading indicator
+  document.querySelectorAll('form[action*="/extract-balance"]').forEach(form => {
+    form.addEventListener('submit', function () {
+      const btn = this.querySelector('button[type="submit"]');
+      btn.textContent = 'Extracting…';
+    });
+  });
+
+  // Closing balance input (save on blur)
+  document.querySelectorAll('.balance-input').forEach(inp => {
+    inp.addEventListener('blur', async function () {
+      const val = this.value.trim();
+      const ok = await saveField(this.dataset.sid, { closing_balance: val });
+      flash(this, ok);
+    });
+    // Also save on Enter
+    inp.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { e.preventDefault(); this.blur(); }
+    });
+  });
+})();
+</script>
+
+{% endblock %}

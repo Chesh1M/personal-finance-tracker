@@ -1,0 +1,346 @@
+{% extends "base.html" %}
+{% block title %}Transactions — Finance Tracker{% endblock %}
+{% block main_class %}wide{% endblock %}
+
+{% block content %}
+
+{# ── Page header ──────────────────────────────────────────────────── #}
+<div class="page-header" style="margin-bottom: 1.25rem;">
+  <h1>Transactions</h1>
+  <p class="subtitle">
+    {{ total }} transaction{{ 's' if total != 1 }}
+    {% if total > 0 %}
+      &nbsp;·&nbsp;
+      <span class="amount-debit">-${{ "%.2f"|format(total_debit) }}</span>
+      &nbsp;
+      <span class="amount-credit">+${{ "%.2f"|format(total_credit) }}</span>
+    {% endif %}
+    {% if total > page_size %}
+      &nbsp;·&nbsp; page {{ page }} of {{ total_pages }}
+    {% endif %}
+  </p>
+</div>
+
+{# ── Filter panel ─────────────────────────────────────────────────── #}
+<div class="card filter-panel">
+  <form method="GET" action="/transactions" id="filter-form">
+    <div class="filter-grid">
+
+      {# Description search #}
+      <div class="filter-field filter-field-wide">
+        <label class="filter-label" for="f-q">Description</label>
+        <input type="text" id="f-q" name="q" value="{{ f_q }}"
+               placeholder="Search description…"
+               class="filter-input">
+      </div>
+
+      {# Date from #}
+      <div class="filter-field">
+        <label class="filter-label" for="f-from">From date</label>
+        <input type="date" id="f-from" name="from_date" value="{{ f_from_date }}"
+               class="filter-input">
+      </div>
+
+      {# Date to #}
+      <div class="filter-field">
+        <label class="filter-label" for="f-to">To date</label>
+        <input type="date" id="f-to" name="to_date" value="{{ f_to_date }}"
+               class="filter-input">
+      </div>
+
+      {# Type #}
+      <div class="filter-field">
+        <label class="filter-label" for="f-type">Type</label>
+        <select id="f-type" name="type" class="filter-input">
+          <option value="">All types</option>
+          <option value="debit"   {% if f_type == 'debit'  %}selected{% endif %}>Debit (out)</option>
+          <option value="credit"  {% if f_type == 'credit' %}selected{% endif %}>Credit (in)</option>
+        </select>
+      </div>
+
+      {# Category #}
+      <div class="filter-field">
+        <label class="filter-label" for="f-cat">Category</label>
+        <select id="f-cat" name="category_id" class="filter-input">
+          <option value="">All categories</option>
+          <option value="0" {% if f_category_id == '0' %}selected{% endif %}>Uncategorized</option>
+          {% for cat in categories %}
+          <option value="{{ cat.id }}" {% if f_category_id == cat.id|string %}selected{% endif %}>
+            {{ cat.display_name }}
+          </option>
+          {% endfor %}
+        </select>
+      </div>
+
+      {# Account type #}
+      <div class="filter-field">
+        <label class="filter-label" for="f-acct">Account</label>
+        <select id="f-acct" name="account" class="filter-input">
+          <option value="">All accounts</option>
+          {% for acct in account_types %}
+          <option value="{{ acct }}" {% if f_account == acct %}selected{% endif %}>{{ acct }}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      {# Transfers #}
+      <div class="filter-field">
+        <label class="filter-label" for="f-transfer">Transfers</label>
+        <select id="f-transfer" name="is_transfer" class="filter-input">
+          <option value="">All</option>
+          <option value="0" {% if f_is_transfer == '0' %}selected{% endif %}>Exclude transfers</option>
+          <option value="1" {% if f_is_transfer == '1' %}selected{% endif %}>Transfers only</option>
+        </select>
+      </div>
+
+      {# Reviewed #}
+      <div class="filter-field">
+        <label class="filter-label" for="f-reviewed">Reviewed</label>
+        <select id="f-reviewed" name="reviewed" class="filter-input">
+          <option value="">All</option>
+          <option value="1" {% if f_reviewed == '1' %}selected{% endif %}>Reviewed only</option>
+          <option value="0" {% if f_reviewed == '0' %}selected{% endif %}>Unreviewed only</option>
+        </select>
+      </div>
+
+    </div>{# end .filter-grid #}
+
+    <div class="filter-actions">
+      <button type="submit" class="btn btn-primary" style="font-size:0.83rem; padding:0.4rem 1.1rem;">
+        Apply Filters
+      </button>
+      <a href="/transactions" class="btn btn-ghost" style="font-size:0.83rem; padding:0.4rem 0.9rem;">
+        Clear
+      </a>
+    </div>
+  </form>
+</div>
+
+{# ── Transaction table ─────────────────────────────────────────────── #}
+{% if transactions %}
+<div class="card" style="padding: 0; overflow: hidden; margin-top: 1rem;">
+  <div class="table-scroll">
+    <table class="tx-table">
+      <thead>
+        <tr>
+          <th>Posted</th>
+          <th>Tx Date</th>
+          <th>Description</th>
+          <th>Amount</th>
+          <th>Type</th>
+          <th>Account</th>
+          <th>Category</th>
+          <th title="Is this an internal transfer? Changes when you update the category.">Transfer?</th>
+          <th>Reviewed?</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for tx in transactions %}
+        <tr class="tx-row" data-id="{{ tx.id }}">
+
+          {# Posted date #}
+          <td class="tx-date">{{ tx.date.strftime('%d %b %Y') }}</td>
+
+          {# Actual transaction date (if different from posted) #}
+          <td class="tx-date">
+            {% if tx.transaction_date and tx.transaction_date != tx.date %}
+              {{ tx.transaction_date.strftime('%d %b %Y') }}
+            {% else %}
+              <span style="color:var(--text-subtle);">—</span>
+            {% endif %}
+          </td>
+
+          {# Description #}
+          <td class="tx-desc" title="{{ tx.description }}">{{ tx.description }}</td>
+
+          {# Amount #}
+          <td class="tx-amount {% if tx.type == 'credit' %}amount-credit{% else %}amount-debit{% endif %}">
+            {% if tx.type == 'credit' %}+{% else %}-{% endif %}${{ "%.2f"|format(tx.amount|abs) }}
+          </td>
+
+          {# Type — clickable to toggle (same AJAX as review.html) #}
+          <td>
+            <span class="badge badge-{{ tx.type }} type-toggle"
+                  data-id="{{ tx.id }}" data-type="{{ tx.type }}"
+                  style="cursor:pointer;"
+                  title="Click to flip debit / credit">{{ tx.type }}</span>
+          </td>
+
+          {# Account #}
+          <td class="tx-account">{{ tx.account_type or '—' }}</td>
+
+          {# Category — editable dropdown (same AJAX as review.html) #}
+          <td>
+            <form class="inline-form cat-form">
+              <input type="hidden" name="tx_id" value="{{ tx.id }}">
+              <input type="hidden" name="is_transfer" value="{{ '1' if tx.is_transfer else '0' }}">
+              <select name="category_id" class="category-select">
+                <option value="">— unassigned —</option>
+                {% for cat in categories %}
+                <option value="{{ cat.id }}"
+                        data-is-transfer="{{ '1' if cat.is_transfer else '0' }}"
+                        {% if tx.category_id == cat.id %}selected{% endif %}>
+                  {{ cat.display_name }}
+                </option>
+                {% endfor %}
+              </select>
+            </form>
+          </td>
+
+          {# Transfer badge — read-only, syncs when category changes #}
+          <td>
+            <span class="badge {% if tx.is_transfer %}badge-transfer{% else %}badge-neutral{% endif %} transfer-badge"
+                  title="{% if tx.is_transfer %}This is an internal transfer — excluded from spending analytics. Change category to fix.{% else %}Not a transfer — counted in analytics{% endif %}">
+              {% if tx.is_transfer %}Transfer{% else %}—{% endif %}
+            </span>
+          </td>
+
+          {# Reviewed badge #}
+          <td>
+            {% if tx.is_reviewed %}
+            <span class="badge" style="background:rgba(16,185,129,0.15); color:#6ee7b7;" title="Appears in dashboard analytics">✓ Reviewed</span>
+            {% else %}
+            <span class="badge badge-neutral" title="Not yet confirmed — go to Review page">Pending</span>
+            {% endif %}
+          </td>
+
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{# ── Pagination ──────────────────────────────────────────────────────── #}
+{% if total_pages > 1 %}
+<div class="pagination">
+  {# Prev #}
+  {% if page > 1 %}
+  <a class="pagination-btn" href="/transactions?{{ filter_qs }}{% if filter_qs %}&{% endif %}page={{ page - 1 }}">← Prev</a>
+  {% else %}
+  <span class="pagination-btn pagination-btn-disabled">← Prev</span>
+  {% endif %}
+
+  {# Page number window (up to 5 pages around current) #}
+  {% set window_start = [1, page - 2] | max %}
+  {% set window_end   = [total_pages, page + 2] | min %}
+
+  {% if window_start > 1 %}
+  <a class="pagination-btn" href="/transactions?{{ filter_qs }}{% if filter_qs %}&{% endif %}page=1">1</a>
+  {% if window_start > 2 %}<span class="pagination-ellipsis">…</span>{% endif %}
+  {% endif %}
+
+  {% for p in range(window_start, window_end + 1) %}
+    {% if p == page %}
+    <span class="pagination-btn pagination-btn-current">{{ p }}</span>
+    {% else %}
+    <a class="pagination-btn" href="/transactions?{{ filter_qs }}{% if filter_qs %}&{% endif %}page={{ p }}">{{ p }}</a>
+    {% endif %}
+  {% endfor %}
+
+  {% if window_end < total_pages %}
+  {% if window_end < total_pages - 1 %}<span class="pagination-ellipsis">…</span>{% endif %}
+  <a class="pagination-btn" href="/transactions?{{ filter_qs }}{% if filter_qs %}&{% endif %}page={{ total_pages }}">{{ total_pages }}</a>
+  {% endif %}
+
+  {# Next #}
+  {% if page < total_pages %}
+  <a class="pagination-btn" href="/transactions?{{ filter_qs }}{% if filter_qs %}&{% endif %}page={{ page + 1 }}">Next →</a>
+  {% else %}
+  <span class="pagination-btn pagination-btn-disabled">Next →</span>
+  {% endif %}
+
+  <span class="pagination-info">{{ total }} transactions</span>
+</div>
+{% endif %}
+
+{% else %}
+<div class="card" style="text-align:center; padding:3rem; margin-top:1rem;">
+  <p style="color:var(--text-muted);">No transactions match your filters.</p>
+  {% if f_q or f_type or f_category_id or f_account or f_from_date or f_to_date or f_is_transfer or f_reviewed %}
+  <a href="/transactions" class="btn btn-ghost" style="margin-top:1rem; display:inline-flex;">Clear Filters</a>
+  {% else %}
+  <a href="/upload" class="btn btn-primary" style="margin-top:1rem; display:inline-flex;">Upload Statement</a>
+  {% endif %}
+</div>
+{% endif %}
+
+{# ── AJAX: type toggle + category update (identical patterns to review.html) ─── #}
+<script>
+(function () {
+  // ── Type toggle (debit ↔ credit) ─────────────────────────────────────
+  document.querySelectorAll('.type-toggle').forEach(btn => {
+    btn.addEventListener('click', async function () {
+      const newType = this.dataset.type === 'debit' ? 'credit' : 'debit';
+      const body = new FormData();
+      body.set('tx_id', this.dataset.id);
+      body.set('type', newType);
+      try {
+        const res = await fetch('/review/update-type', {
+          method: 'POST',
+          headers: { 'X-Requested-With': 'XMLHttpRequest' },
+          body,
+        });
+        if (!res.ok) throw new Error();
+        this.dataset.type = newType;
+        this.textContent = newType;
+        this.className = `badge badge-${newType} type-toggle`;
+        const row = this.closest('tr');
+        const amtCell = row.querySelector('.tx-amount');
+        const amtNum = parseFloat(amtCell.textContent.replace(/[^0-9.]/g, '')).toFixed(2);
+        amtCell.className = `tx-amount ${newType === 'credit' ? 'amount-credit' : 'amount-debit'}`;
+        amtCell.textContent = (newType === 'credit' ? '+' : '-') + '$' + amtNum;
+        this.style.outline = '1px solid var(--success)';
+        setTimeout(() => { this.style.outline = ''; }, 900);
+      } catch {
+        this.style.outline = '1px solid var(--danger)';
+        setTimeout(() => { this.style.outline = ''; }, 1200);
+      }
+    });
+  });
+
+  // ── Category dropdown AJAX save (also syncs transfer badge) ──────────
+  document.querySelectorAll('.cat-form select').forEach(select => {
+    select.addEventListener('change', async function () {
+      const form = this.closest('.cat-form');
+      const selectedOpt = this.options[this.selectedIndex];
+      const isTransfer = selectedOpt.dataset.isTransfer || '0';
+      const body = new FormData(form);
+      body.set('category_id', this.value);
+      body.set('is_transfer', isTransfer);
+      this.style.transition = 'border-color 0.2s';
+      try {
+        const res = await fetch('/review/update-category', {
+          method: 'POST',
+          headers: { 'X-Requested-With': 'XMLHttpRequest' },
+          body,
+        });
+        if (!res.ok) throw new Error();
+        this.style.borderColor = 'var(--success)';
+        setTimeout(() => { this.style.borderColor = ''; }, 900);
+
+        // Sync the is_transfer hidden input and the Transfer badge
+        form.querySelector('input[name="is_transfer"]').value = isTransfer;
+
+        const tBadge = this.closest('tr').querySelector('.transfer-badge');
+        if (tBadge) {
+          if (isTransfer === '1') {
+            tBadge.textContent = 'Transfer';
+            tBadge.className = 'badge badge-transfer transfer-badge';
+            tBadge.title = 'This is an internal transfer — excluded from spending analytics. Change category to fix.';
+          } else {
+            tBadge.textContent = '—';
+            tBadge.className = 'badge badge-neutral transfer-badge';
+            tBadge.title = 'Not a transfer — counted in analytics';
+          }
+        }
+      } catch {
+        this.style.borderColor = 'var(--danger)';
+        setTimeout(() => { this.style.borderColor = ''; }, 1200);
+      }
+    });
+  });
+})();
+</script>
+
+{% endblock %}

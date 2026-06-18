@@ -1,0 +1,210 @@
+{% extends "base.html" %}
+{% block title %}Upload Statement — Finance Tracker{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>Upload Bank Statement</h1>
+  <p class="subtitle">Upload a PDF statement. Transactions will be extracted automatically and queued for your review.</p>
+</div>
+
+{% if error %}
+<div class="alert alert-error"><strong>Upload failed:</strong> {{ error }}</div>
+{% endif %}
+{% if request.query_params.get('deleted') %}
+<div class="alert alert-success">Statement and its transactions deleted.</div>
+{% endif %}
+{% if request.query_params.get('balance_extracted') %}
+<div class="alert alert-success">Balance extraction complete — check the Closing Balance column below.</div>
+{% endif %}
+
+<div class="card">
+  <form method="post" action="/upload" enctype="multipart/form-data" id="upload-form">
+
+    <div class="form-group">
+      <label for="bank_source">Bank / Source</label>
+      <input type="text" name="bank_source" id="bank_source" list="banks-list"
+             placeholder="Type or select a bank…" required autocomplete="off" />
+      <datalist id="banks-list">
+        {% for bank in banks %}
+        <option value="{{ bank }}">
+        {% endfor %}
+      </datalist>
+      <span class="hint">Choose from the list or type a new bank name.</span>
+    </div>
+
+    <div class="form-group">
+      <label for="file">Statement PDF</label>
+      <div class="drop-zone" id="drop-zone">
+        <div class="drop-zone-inner">
+          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+          <p class="drop-zone-text">Drag &amp; drop a PDF here, or <label for="file" class="drop-zone-link">browse</label></p>
+          <p class="drop-zone-filename" id="drop-zone-filename"></p>
+        </div>
+        <input type="file" name="file" id="file" accept=".pdf" required />
+      </div>
+      <span class="hint">PDF only. Your file is stored locally and never sent anywhere except the OpenAI API for parsing.</span>
+    </div>
+
+    <button type="submit" class="btn btn-primary" id="submit-btn">
+      Upload &amp; Extract
+    </button>
+
+    <div class="upload-progress" id="upload-progress">
+      <div class="upload-progress-bar"></div>
+    </div>
+    <p class="upload-status" id="upload-status"></p>
+  </form>
+</div>
+
+{% if statements %}
+<div class="page-header" style="margin-top: 2rem;">
+  <h1>Uploaded Statements</h1>
+</div>
+<div class="card" style="padding: 0; overflow: hidden;">
+  <div class="table-scroll">
+    <table class="tx-table">
+      <thead>
+        <tr>
+          <th>File</th>
+          <th>Bank</th>
+          <th>Uploaded</th>
+          <th>Transactions</th>
+          <th>Debits / Credits</th>
+          <th>Closing Balance</th>
+          <th>Status</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in statements %}
+        {% set skipped_txs = skipped_map.get(s.id, []) %}
+        {% set s_totals = totals_map.get(s.id, {}) %}
+        <tr>
+          <td class="tx-desc" title="{{ s.filename }}">{{ s.filename }}</td>
+          <td>{{ s.bank_source }}</td>
+          <td class="tx-date">{{ s.upload_date.strftime('%d %b %Y, %H:%M') }}</td>
+          <td style="color: var(--text-muted);">
+            {{ s.transactions | length }}
+            {% if skipped_txs %}
+            <button class="btn btn-ghost" style="font-size:0.7rem; padding:0.15rem 0.5rem; margin-left:0.4rem; color:var(--warning);"
+                    onclick="this.closest('tr').nextElementSibling.classList.toggle('hidden')">
+              {{ skipped_txs | length }} skipped
+            </button>
+            {% endif %}
+          </td>
+          <td style="font-family:'IBM Plex Mono',monospace; font-size:0.82rem; white-space:nowrap;">
+            {% if s_totals %}
+            <span class="amount-debit">-${{ "%.2f"|format(s_totals.get('debit', 0)) }}</span>
+            <span style="color:var(--text-subtle); margin:0 0.3rem;">/</span>
+            <span class="amount-credit">+${{ "%.2f"|format(s_totals.get('credit', 0)) }}</span>
+            {% else %}
+            <span style="color:var(--text-muted);">—</span>
+            {% endif %}
+          </td>
+          <td style="font-family:'IBM Plex Mono',monospace; font-size:0.83rem;">
+            {% if s.closing_balance is not none %}
+              <span class="amount-credit">${{ "%.2f"|format(s.closing_balance) }}</span>
+              <span style="color:var(--text-subtle); font-size:0.72rem; margin-left:0.3rem;">{{ s.account_type or '' }}</span>
+            {% else %}
+              <span style="color:var(--text-muted);">—</span>
+            {% endif %}
+          </td>
+          <td><span class="badge badge-{{ 'credit' if s.status == 'completed' else ('spending' if s.status == 'processing' else 'debit') }}">{{ s.status }}</span></td>
+          <td>
+            <div style="display:flex; gap:0.5rem; align-items:center;">
+              {%- if s.status == 'completed' and s.raw_text %}
+              <form method="post" action="/statements/{{ s.id }}/extract-balance"
+                    class="extract-balance-form"
+                    style="display:contents;"
+                    title="Re-run AI to extract closing balance from stored statement text">
+                <button type="submit" class="btn btn-ghost" style="font-size:0.75rem; padding:0.25rem 0.6rem;">
+                  Extract Balance
+                </button>
+              </form>
+              {%- endif %}
+              <form method="post" action="/statements/{{ s.id }}/delete"
+                    style="display:contents;"
+                    onsubmit="return confirm('Delete {{ s.filename }} and all {{ s.transactions | length }} transaction(s)? This cannot be undone.')">
+                <button type="submit" class="btn-delete">Delete</button>
+              </form>
+            </div>
+          </td>
+        </tr>
+        {% if skipped_txs %}
+        <tr class="hidden" style="background: var(--surface);">
+          <td colspan="7" style="padding: 0.75rem 1rem;">
+            <p style="font-size:0.78rem; color:var(--warning); margin-bottom:0.5rem; font-weight:500;">
+              {{ skipped_txs | length }} duplicate(s) skipped — these transactions already exist in the database:
+            </p>
+            <table style="width:100%; font-size:0.78rem; border-collapse:collapse;">
+              <thead>
+                <tr style="color:var(--text-muted); text-align:left;">
+                  <th style="padding:0.25rem 0.75rem 0.25rem 0;">Date</th>
+                  <th style="padding:0.25rem 0.75rem;">Description</th>
+                  <th style="padding:0.25rem 0.75rem;">Amount</th>
+                  <th style="padding:0.25rem 0;">Type</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for tx in skipped_txs %}
+                <tr style="border-top: 1px solid var(--border);">
+                  <td style="padding:0.3rem 0.75rem 0.3rem 0; font-family:'IBM Plex Mono',monospace; white-space:nowrap;">{{ tx.date }}</td>
+                  <td style="padding:0.3rem 0.75rem; color:var(--text-muted);">{{ tx.description }}</td>
+                  <td style="padding:0.3rem 0.75rem; font-family:'IBM Plex Mono',monospace;">${{ "%.2f"|format(tx.amount) }}</td>
+                  <td style="padding:0.3rem 0;"><span class="badge badge-{{ 'debit' if tx.type == 'debit' else 'credit' }}">{{ tx.type }}</span></td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </td>
+        </tr>
+        {% endif %}
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+<script>
+  const dropZone = document.getElementById('drop-zone');
+  const fileInput = document.getElementById('file');
+  const filenameEl = document.getElementById('drop-zone-filename');
+
+  function setFile(file) {
+    if (!file || !file.name.toLowerCase().endsWith('.pdf')) return;
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    fileInput.files = dt.files;
+    filenameEl.textContent = file.name;
+    dropZone.classList.add('has-file');
+  }
+
+  dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+  dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+  dropZone.addEventListener('drop', e => {
+    e.preventDefault();
+    dropZone.classList.remove('drag-over');
+    setFile(e.dataTransfer.files[0]);
+  });
+  fileInput.addEventListener('change', () => setFile(fileInput.files[0]));
+
+  document.querySelectorAll('.extract-balance-form').forEach(form => {
+    form.addEventListener('submit', function () {
+      const btn = this.querySelector('button[type="submit"]');
+      btn.textContent = 'Extracting…';
+    });
+  });
+
+  document.getElementById('upload-form').addEventListener('submit', function () {
+    const btn = document.getElementById('submit-btn');
+    const progress = document.getElementById('upload-progress');
+    const status = document.getElementById('upload-status');
+    btn.textContent = 'Uploading…';
+    btn.disabled = true;
+    progress.classList.add('active');
+    status.textContent = 'Extracting text from PDF…';
+    setTimeout(() => { status.textContent = 'Parsing transactions with AI… this may take 15–30 seconds.'; }, 4000);
+    setTimeout(() => { status.textContent = 'Auto-categorizing transactions…'; }, 25000);
+  });
+</script>
+{% endblock %}

@@ -1,0 +1,21 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+alembic
+pdfplumber
+openai
+yfinance
+jinja2
+python-multipart
+python-dotenv
+pydantic
+# Auth
+authlib
+httpx
+itsdangerous
+# Rate limiting
+slowapi
+# CSRF protection
+starlette-csrf
+# PostgreSQL driver (for Render deployment)
+psycopg2-binary

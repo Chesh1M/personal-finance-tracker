@@ -1,0 +1,852 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Finance Tracker{% endblock %}
+{% block main_class %}wide{% endblock %}
+
+{% block content %}
+
+{# ── Page header + month filter ───────────────────────────────────────── #}
+<div class="dash-header">
+  <div class="dash-header-title">
+    <h1>Dashboard</h1>
+    {% if not empty %}<span class="dash-period">{{ stats.period_label }} vs {{ comparison_stats.period_label }}</span>{% endif %}
+  </div>
+
+  {% if not empty %}
+  <form method="GET" action="/dashboard" class="month-filter-form">
+    <select name="month" class="month-filter-select" onchange="this.form.submit()" aria-label="Select period">
+      {% for opt in month_options %}
+      <option value="{{ opt.value }}"{% if opt.value == selected_month %} selected{% endif %}>{{ opt.label }}</option>
+      {% endfor %}
+    </select>
+    <span class="month-vs-sep">vs</span>
+    <select name="comparison_month" class="month-filter-select" onchange="this.form.submit()" aria-label="Comparison period">
+      {% for opt in month_options %}
+      <option value="{{ opt.value }}"{% if opt.value == comparison_month %} selected{% endif %}>{{ opt.label }}</option>
+      {% endfor %}
+    </select>
+  </form>
+  {% endif %}
+</div>
+
+{# ── Empty state ──────────────────────────────────────────────────────── #}
+{% if empty %}
+<div class="card dash-empty">
+  <p style="font-size:1rem; font-weight:600; color:var(--text);">No reviewed transactions yet</p>
+  <p>Upload a bank statement and review your transactions to see analytics here.</p>
+  <div>
+    <a href="/upload" class="btn btn-primary">Upload Statement</a>
+    <a href="/review" class="btn btn-ghost">Review Transactions</a>
+  </div>
+</div>
+
+{% else %}
+
+{# ── Account Balances ─────────────────────────────────────────────────── #}
+{% if account_balances.has_data %}
+<h2 class="section-heading">Financial Overview</h2>
+<div class="card account-balances-card">
+  <p class="chart-title">Account Balances
+    <span class="chart-subtitle">{{ stats.period_label }}
+      &nbsp;·&nbsp; <a href="/balances" style="color:var(--primary); font-weight:400;">Edit →</a>
+    </span>
+  </p>
+  <div class="account-balances-list">
+    {% for acct in account_balances.accounts %}
+    <div class="account-balance-row">
+      <span class="account-name">{{ acct.bank_source }}</span>
+      <span class="account-type-badge">{{ acct.account_type }}</span>
+      <span class="account-balance-amount {% if acct.is_liability %}amount-debit{% else %}amount-credit{% endif %}">
+        {% if acct.is_liability %}−{% endif %}${{ "%.2f"|format(acct.closing_balance) }}
+      </span>
+      {% if acct.comparison_balance is not none %}
+      <span class="acct-compare">
+        vs ${{ "%.2f"|format(acct.comparison_balance) }}
+        {% if acct.comparison_balance_pct is not none %}
+        <span class="{% if (not acct.is_liability and acct.comparison_balance_pct > 0) or (acct.is_liability and acct.comparison_balance_pct < 0) %}comp-better{% elif acct.comparison_balance_pct != 0 %}comp-worse{% endif %}">
+          {{ '↑' if acct.comparison_balance_pct > 0 else '↓' }}{{ "%.1f"|format(acct.comparison_balance_pct|abs) }}%
+        </span>
+        {% endif %}
+      </span>
+      {% endif %}
+    </div>
+    {% endfor %}
+    <div class="account-balance-total">
+      <span style="font-weight:600; font-size:0.83rem;">Net bank total</span>
+      <div style="display:flex; align-items:center; gap:0.75rem;">
+        <span class="account-balance-amount {% if account_balances.net_total >= 0 %}amount-credit{% else %}amount-debit{% endif %}" style="font-weight:700; font-size:1rem; font-family:'IBM Plex Mono',monospace;">
+          ${{ "%.2f"|format(account_balances.net_total|abs) }}
+        </span>
+        {% if account_balances.comparison_net_total is not none %}
+        <span class="acct-compare">
+          vs ${{ "%.2f"|format(account_balances.comparison_net_total|abs) }}
+          {% if account_balances.comparison_net_total_pct is not none %}
+          <span class="{{ 'comp-better' if account_balances.comparison_net_total_pct > 0 else 'comp-worse' if account_balances.comparison_net_total_pct != 0 else '' }}">
+            {{ '↑' if account_balances.comparison_net_total_pct > 0 else '↓' }}{{ "%.1f"|format(account_balances.comparison_net_total_pct|abs) }}%
+          </span>
+          {% endif %}
+        </span>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+<h2 class="section-heading">Spending Analytics</h2>
+
+{# ── Summary stat cards ───────────────────────────────────────────────── #}
+<div class="dash-stat-grid">
+
+  {# Total Spending #}
+  <div class="stat-card">
+    <p class="stat-label">Total Spending</p>
+    <p class="stat-value">${{ "%.2f"|format(stats.total_spending) }}</p>
+    <p class="stat-sub">Debits, excl. transfers</p>
+    {% if comparison_deltas.total_spending_pct is not none %}
+    <p class="stat-compare">
+      vs ${{ "%.2f"|format(comparison_deltas.total_spending_prev) }}
+      <span class="{{ 'comp-better' if comparison_deltas.total_spending_pct < 0 else 'comp-worse' }}">
+        {{ '↑' if comparison_deltas.total_spending_pct > 0 else '↓' }}{{ "%.1f"|format(comparison_deltas.total_spending_pct|abs) }}%
+      </span>
+    </p>
+    {% endif %}
+  </div>
+
+  {# Total Income #}
+  <div class="stat-card stat-good">
+    <p class="stat-label">Total Income</p>
+    <p class="stat-value">${{ "%.2f"|format(stats.total_income) }}</p>
+    <p class="stat-sub">Income category only</p>
+    {% if comparison_deltas.total_income_pct is not none %}
+    <p class="stat-compare">
+      vs ${{ "%.2f"|format(comparison_deltas.total_income_prev) }}
+      <span class="{{ 'comp-better' if comparison_deltas.total_income_pct > 0 else 'comp-worse' }}">
+        {{ '↑' if comparison_deltas.total_income_pct > 0 else '↓' }}{{ "%.1f"|format(comparison_deltas.total_income_pct|abs) }}%
+      </span>
+    </p>
+    {% endif %}
+  </div>
+
+  {# Savings Rate — color-coded by value #}
+  {% if stats.savings_rate is none %}
+  <div class="stat-card">
+    <p class="stat-label">Savings Rate</p>
+    <p class="stat-value">—</p>
+    <p class="stat-sub">No income recorded</p>
+  </div>
+  {% elif stats.savings_rate < 0 %}
+  <div class="stat-card stat-danger">
+    <p class="stat-label">Savings Rate</p>
+    <p class="stat-value">{{ "%.1f"|format(stats.savings_rate) }}%</p>
+    <p class="stat-sub">Spent more than earned</p>
+    {% if comparison_deltas.savings_rate_delta is not none %}
+    <p class="stat-compare">
+      vs {{ "%.1f"|format(comparison_deltas.savings_rate_prev) if comparison_deltas.savings_rate_prev is not none else '—' }}%
+      <span class="{{ 'comp-better' if comparison_deltas.savings_rate_delta > 0 else 'comp-worse' if comparison_deltas.savings_rate_delta < 0 else '' }}">
+        {{ '↑' if comparison_deltas.savings_rate_delta > 0 else '↓' }}{{ "%.1f"|format(comparison_deltas.savings_rate_delta|abs) }} pp
+      </span>
+    </p>
+    {% endif %}
+  </div>
+  {% elif stats.savings_rate >= 20 %}
+  <div class="stat-card stat-good">
+    <p class="stat-label">Savings Rate</p>
+    <p class="stat-value">{{ "%.1f"|format(stats.savings_rate) }}%</p>
+    <p class="stat-sub">${{ "%.2f"|format(stats.savings) }} saved</p>
+    {% if comparison_deltas.savings_rate_delta is not none %}
+    <p class="stat-compare">
+      vs {{ "%.1f"|format(comparison_deltas.savings_rate_prev) if comparison_deltas.savings_rate_prev is not none else '—' }}%
+      <span class="{{ 'comp-better' if comparison_deltas.savings_rate_delta > 0 else 'comp-worse' if comparison_deltas.savings_rate_delta < 0 else '' }}">
+        {{ '↑' if comparison_deltas.savings_rate_delta > 0 else '↓' }}{{ "%.1f"|format(comparison_deltas.savings_rate_delta|abs) }} pp
+      </span>
+    </p>
+    {% endif %}
+  </div>
+  {% else %}
+  <div class="stat-card stat-warn">
+    <p class="stat-label">Savings Rate</p>
+    <p class="stat-value">{{ "%.1f"|format(stats.savings_rate) }}%</p>
+    <p class="stat-sub">${{ "%.2f"|format(stats.savings) }} saved</p>
+    {% if comparison_deltas.savings_rate_delta is not none %}
+    <p class="stat-compare">
+      vs {{ "%.1f"|format(comparison_deltas.savings_rate_prev) if comparison_deltas.savings_rate_prev is not none else '—' }}%
+      <span class="{{ 'comp-better' if comparison_deltas.savings_rate_delta > 0 else 'comp-worse' if comparison_deltas.savings_rate_delta < 0 else '' }}">
+        {{ '↑' if comparison_deltas.savings_rate_delta > 0 else '↓' }}{{ "%.1f"|format(comparison_deltas.savings_rate_delta|abs) }} pp
+      </span>
+    </p>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {# Transaction count #}
+  <div class="stat-card">
+    <p class="stat-label">Transactions</p>
+    <p class="stat-value">{{ stats.tx_count }}</p>
+    <p class="stat-sub">Reviewed, excl. transfers</p>
+    <p class="stat-compare">
+      vs {{ comparison_deltas.tx_count_prev }} txns
+      {% if comparison_deltas.tx_count_delta != 0 %}
+      <span>{{ '↑' if comparison_deltas.tx_count_delta > 0 else '↓' }}{{ comparison_deltas.tx_count_delta|abs }}</span>
+      {% endif %}
+    </p>
+  </div>
+
+</div>
+
+{# ── Insights + Reimbursements side-by-side ───────────────────────────── #}
+{% if insights or selected_month %}
+<div class="dash-chart-row" style="grid-template-columns: 1fr 1fr; margin-bottom: 1rem;">
+
+  {# Left: Insights #}
+  {% if insights %}
+  <div class="dash-chart-card">
+    <p class="chart-title">Insights <span class="chart-subtitle">{{ stats.period_label }}</span></p>
+    {% for card in insights %}
+    <div class="insight-row insight-{{ card.type }}">
+      <span class="insight-icon" aria-hidden="true">{% if card.type == 'good' %}✓{% else %}⚠{% endif %}</span>
+      <div>
+        <p class="insight-title">{{ card.title }}</p>
+        <p class="insight-body">{{ card.body }}</p>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div></div>
+  {% endif %}
+
+  {# Right: Reimbursements #}
+  {% if reimbursements.has_data %}
+  <div class="dash-chart-card">
+    <p class="chart-title">Reimbursements
+      <span class="chart-subtitle">+${{ "%.2f"|format(reimbursements.total) }} · tag to offset spending</span>
+    </p>
+    {% for tx in reimbursements.transactions %}
+    <div class="reimb-row">
+      <span class="reimb-date">{{ tx.date }}</span>
+      <span class="reimb-desc" title="{{ tx.description }}">{{ tx.description }}</span>
+      {% if tx.split_start_month %}
+        <span class="reimb-split-label" title="split · {{ tx.split_start_month }} → {{ tx.split_end_month }}{% if tx.tag_name %} · {{ tx.tag_name }}{% endif %}">split · {{ tx.split_start_month }} → {{ tx.split_end_month }}{% if tx.tag_name %} · {{ tx.tag_name }}{% endif %}</span>
+        <button class="reimb-split-btn" data-txid="{{ tx.id }}" data-amount="{{ tx.amount }}" data-desc="{{ tx.description }}" data-cat-id="{{ tx.reimbursement_category_id or '' }}" data-start="{{ tx.split_start_month }}" data-end="{{ tx.split_end_month }}">edit split</button>
+      {% else %}
+        <select class="reimb-cat-select category-select" data-txid="{{ tx.id }}">
+          <option value="">— no tag —</option>
+          {% for cat in spending_categories %}
+          <option value="{{ cat.id }}" {% if tx.reimbursement_category_id == cat.id %}selected{% endif %}>{{ cat.display_name }}</option>
+          {% endfor %}
+        </select>
+        <button class="reimb-split-btn" data-txid="{{ tx.id }}" data-amount="{{ tx.amount }}" data-desc="{{ tx.description }}" data-cat-id="{{ tx.reimbursement_category_id or '' }}" data-start="" data-end="">add split</button>
+      {% endif %}
+      <span class="amount-credit reimb-amount">+${{ "%.2f"|format(tx.amount) }}</span>
+    </div>
+    {% endfor %}
+  </div>
+  {% elif selected_month %}
+  <div class="dash-chart-card">
+    <p class="chart-title">Reimbursements</p>
+    <p style="color:var(--text-muted); font-size:0.85rem; padding: 0.75rem 0;">No reimbursements in {{ stats.period_label }}.</p>
+  </div>
+  {% else %}
+  <div></div>
+  {% endif %}
+
+</div>
+{% endif %}
+
+{# ── Spending by Category + Breakdown Donut ───────────────────────────── #}
+{% if stats.total_spending > 0 %}
+<div class="dash-chart-row" style="grid-template-columns: 3fr 2fr;">
+  <div class="dash-chart-card">
+    <p class="chart-title">Spending by Category
+      <span class="chart-subtitle">Top 10 · click a bar or donut segment to drill down</span>
+    </p>
+    <div id="bar-container" style="position:relative;">
+      <canvas id="bar-chart" role="img" aria-label="Category spending bar chart"></canvas>
+    </div>
+  </div>
+  <div class="dash-chart-card">
+    <div class="donut-card-header">
+      <p class="chart-title" id="donut-title">Spending Breakdown
+        <span class="chart-subtitle">All categories</span>
+      </p>
+      <button id="donut-back-btn" class="donut-back-btn" hidden>&#8592; Back</button>
+    </div>
+    <div id="donut-container" style="position:relative;">
+      <canvas id="donut-chart" role="img" aria-label="Spending breakdown donut chart"></canvas>
+    </div>
+  </div>
+</div>
+{% else %}
+<div class="dash-chart-full">
+  <p class="chart-title">Spending by Category</p>
+  <p style="color:var(--text-muted); font-size:0.83rem; padding-top:2rem; text-align:center;">No spending data for this period.</p>
+</div>
+{% endif %}
+
+{# ── Monthly Spending Trend (line chart) ──────────────────────────────── #}
+<div class="dash-chart-full">
+  <p class="chart-title">
+    Monthly Spending Trend
+    <span class="chart-subtitle">Last 12 months</span>
+  </p>
+  <div style="position:relative; height:220px;">
+    <canvas id="trend-chart" role="img" aria-label="Monthly spending trend line chart"></canvas>
+  </div>
+</div>
+
+{# ── Split reimbursement modal ───────────────────────────────────────── #}
+<div id="split-overlay" class="split-overlay" hidden>
+  <div class="split-modal">
+    <p class="chart-title">Split Reimbursement</p>
+    <p class="split-modal-desc" id="split-modal-desc"></p>
+    <div class="split-modal-fields">
+      <label class="form-label">Category</label>
+      <select id="split-cat-select" class="form-input">
+        <option value="">— select —</option>
+        {% for cat in spending_categories %}
+        <option value="{{ cat.id }}">{{ cat.display_name }}</option>
+        {% endfor %}
+      </select>
+      <label class="form-label">Start month</label>
+      <input type="month" id="split-start" class="form-input">
+      <label class="form-label">End month</label>
+      <input type="month" id="split-end" class="form-input">
+      <p class="split-preview" id="split-preview"></p>
+    </div>
+    <div class="split-modal-actions">
+      <button id="split-save-btn" class="btn btn-primary">Save Split</button>
+      <button id="split-remove-btn" class="btn btn-ghost" hidden>Remove Split</button>
+      <button id="split-cancel-btn" class="btn btn-ghost">Cancel</button>
+    </div>
+  </div>
+</div>
+
+{# ── Chart.js initialisation ───────────────────────────────────────────── #}
+<script>
+(function () {
+  // ── Data from server ─────────────────────────────────────────────────
+  let   categoryData         = {{ category_json | safe }};
+  let   comparisonCategoryData = {{ comparison_category_json | safe }};
+  const categoryDetails      = {{ category_details_json | safe }};
+  const trendData            = {{ trend_json | safe }};
+  const selectedMonth        = "{{ selected_month }}";
+  const comparisonMonth      = "{{ comparison_month }}";
+
+  // ── Global Chart.js defaults ─────────────────────────────────────────
+  Chart.defaults.color       = 'rgba(250,250,250,0.5)';
+  Chart.defaults.borderColor = 'rgba(255,255,255,0.08)';
+  Chart.defaults.font.family = "'IBM Plex Sans', system-ui, sans-serif";
+  Chart.defaults.font.size   = 12;
+
+  Chart.register(ChartDataLabels);
+
+  // ── Color palette (matches design tokens) ────────────────────────────
+  const PALETTE = [
+    '#0C5CAB', '#10b981', '#f59e0b', '#ef4444',
+    '#8b5cf6', '#06b6d4', '#f97316', '#84cc16',
+    '#ec4899', '#6366f1', '#14b8a6', '#a78bfa',
+  ];
+
+  // Fixed colors for known categories — guarantees no collisions
+  const CAT_COLORS = {
+    'Cash Withdrawal': '#f97316',
+    'Shopping':        '#ec4899',
+    'Transport':       '#84cc16',
+    'Food & Dining':   '#ef4444',
+    'Subscriptions':   '#a78bfa',
+    'Entertainment':   '#8b5cf6',
+    'Groceries':       '#06b6d4',
+    'Fun Money':       '#6366f1',
+    'Utilities & Bills': '#10b981',
+    'Healthcare':      '#14b8a6',
+    'Travel':          '#0C5CAB',
+    'Education':       '#f59e0b',
+    'Personal Care':   '#e879f9',
+    'Others':          '#78716c',
+    'Uncategorized':   '#6b7280',
+  };
+
+  // Deterministic color — lookup first, hash fallback for unknown future categories
+  function categoryColor(name) {
+    if (CAT_COLORS[name]) return CAT_COLORS[name];
+    let h = 0;
+    for (let i = 0; i < name.length; i++) h = (Math.imul(31, h) + name.charCodeAt(i)) | 0;
+    return PALETTE[Math.abs(h) % PALETTE.length];
+  }
+
+  // ── Shared tooltip style ─────────────────────────────────────────────
+  const tooltipStyle = {
+    backgroundColor: '#1c1c1f',
+    borderColor: 'rgba(255,255,255,0.12)',
+    borderWidth: 1,
+    titleColor: '#fafafa',
+    bodyColor: 'rgba(250,250,250,0.7)',
+    padding: 10,
+    cornerRadius: 6,
+  };
+
+  const sgd = v => '$' + v.toLocaleString('en-SG', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const sgdShort = v => '$' + v.toLocaleString();
+
+  // ── 1. Bar + Donut — Spending by Category ────────────────────────────
+  const barEl   = document.getElementById('bar-chart');
+  const donutEl = document.getElementById('donut-chart');
+  let donutChart      = null;
+  let barChart        = null;
+  let trendChart      = null;
+  let currentDonutCat = null;
+
+  function buildDonutData(cat) {
+    const top = categoryData.slice(0, 10);
+    if (!cat) {
+      return {
+        labels: top.map(d => d.category),
+        values: top.map(d => d.amount),
+        titleHtml: 'Spending Breakdown <span class="chart-subtitle">All categories</span>',
+      };
+    }
+    const txns = categoryDetails[cat] || [];
+    const groups = {};
+    txns.forEach(t => { groups[t.description] = (groups[t.description] || 0) + t.amount; });
+    const sorted = Object.entries(groups).sort((a, b) => b[1] - a[1]);
+    return {
+      labels: sorted.map(([desc]) => desc),
+      values: sorted.map(([, amt]) => amt),
+      titleHtml: cat + ' <span class="chart-subtitle">by merchant</span>',
+    };
+  }
+
+  function renderDonut(cat) {
+    if (!donutEl) return;
+    currentDonutCat = cat;
+    const d = buildDonutData(cat);
+    const titleEl = document.getElementById('donut-title');
+    if (titleEl) titleEl.innerHTML = d.titleHtml;
+    const backBtn = document.getElementById('donut-back-btn');
+    if (backBtn) backBtn.hidden = !cat;
+    if (donutChart) donutChart.destroy();
+    donutChart = new Chart(donutEl, {
+      type: 'doughnut',
+      data: {
+        labels: d.labels,
+        datasets: [{
+          data: d.values,
+          backgroundColor: d.labels.map(name => categoryColor(name)),
+          borderWidth: 2,
+          borderColor: '#09090b',
+          hoverOffset: 6,
+        }],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        onClick: cat ? null : (evt, els) => {
+          if (els.length) {
+            const label = d.labels[els[0].index];
+            if (label) renderDonut(label);
+          }
+        },
+        onHover: cat ? null : (evt, els) => {
+          if (evt.native) evt.native.target.style.cursor = els.length ? 'pointer' : 'default';
+        },
+        plugins: {
+          datalabels: { display: false },
+          legend: {
+            position: 'bottom',
+            labels: {
+              padding: 8,
+              boxWidth: 10,
+              font: { size: 10 },
+              color: 'rgba(250,250,250,0.55)',
+            },
+          },
+          tooltip: {
+            ...tooltipStyle,
+            callbacks: {
+              label: ctx => ' ' + sgd(ctx.parsed),
+            },
+          },
+        },
+      },
+    });
+  }
+
+  const donutBackBtn = document.getElementById('donut-back-btn');
+  if (donutBackBtn) donutBackBtn.addEventListener('click', () => renderDonut(null));
+
+  async function fetchAndRefreshCharts() {
+    const qs = selectedMonth
+      ? `?month=${selectedMonth}&comparison_month=${comparisonMonth}`
+      : '';
+    const res = await fetch('/api/spending' + qs);
+    if (!res.ok) return;
+    const data = await res.json();
+    categoryData = data.categories;
+    comparisonCategoryData = data.comparison_categories || [];
+    const newTop = categoryData.slice(0, 10);
+
+    if (barChart && newTop.length > 0) {
+      barChart.data.labels = newTop.map(d => d.category);
+      barChart.data.datasets[0].data = newTop.map(d => d.amount);
+      barChart.data.datasets[0].backgroundColor = newTop.map(d => categoryColor(d.category));
+      const newCompMap = Object.fromEntries(comparisonCategoryData.map(d => [d.category, d.amount]));
+      barChart._compData = newTop.map(d => newCompMap[d.category] ?? 0);
+      const newH = Math.max(220, newTop.length * 32 + 40);
+      document.getElementById('bar-container').style.height = newH + 'px';
+      const dc = document.getElementById('donut-container');
+      if (dc) dc.style.height = newH + 'px';
+      barChart.update();
+    }
+
+    renderDonut(null);
+
+    // Update stat cards (value + comparison)
+    document.querySelectorAll('.stat-card').forEach(el => {
+      const label = el.querySelector('.stat-label');
+      if (!label) return;
+      const t = label.textContent.trim();
+      if (t === 'Total Spending') {
+        const val = el.querySelector('.stat-value');
+        if (val) val.textContent = '$' + data.total_spending.toFixed(2);
+        const cmp = el.querySelector('.stat-compare');
+        if (cmp && data.comparison_total_spending != null) {
+          const pct = data.comparison_total_spending
+            ? (data.total_spending - data.comparison_total_spending) / Math.abs(data.comparison_total_spending) * 100
+            : null;
+          const arrow = pct !== null ? (pct > 0 ? '↑' : '↓') : '';
+          const cls = pct !== null ? (pct < 0 ? 'comp-better' : 'comp-worse') : '';
+          cmp.innerHTML = `vs $${data.comparison_total_spending.toFixed(2)} <span class="${cls}">${arrow}${pct !== null ? Math.abs(pct).toFixed(1) + '%' : ''}</span>`;
+        }
+      } else if (t === 'Total Income') {
+        const val = el.querySelector('.stat-value');
+        if (val) val.textContent = '$' + (data.total_income ?? 0).toFixed(2);
+        const cmp = el.querySelector('.stat-compare');
+        if (cmp && data.comparison_total_income != null) {
+          const pct = data.comparison_total_income
+            ? ((data.total_income ?? 0) - data.comparison_total_income) / Math.abs(data.comparison_total_income) * 100
+            : null;
+          const arrow = pct !== null ? (pct > 0 ? '↑' : '↓') : '';
+          const cls = pct !== null ? (pct > 0 ? 'comp-better' : 'comp-worse') : '';
+          cmp.innerHTML = `vs $${data.comparison_total_income.toFixed(2)} <span class="${cls}">${arrow}${pct !== null ? Math.abs(pct).toFixed(1) + '%' : ''}</span>`;
+        }
+      } else if (t === 'Savings Rate') {
+        const val = el.querySelector('.stat-value');
+        const sub = el.querySelector('.stat-sub');
+        if (val) {
+          val.textContent = (data.savings_rate === null || data.savings_rate === undefined)
+            ? '—'
+            : data.savings_rate.toFixed(1) + '%';
+        }
+        if (sub && data.savings !== undefined) {
+          sub.textContent = data.savings_rate === null ? 'No income recorded'
+            : '$' + data.savings.toFixed(2) + ' saved';
+        }
+        const cmp = el.querySelector('.stat-compare');
+        if (cmp && data.comparison_savings_rate != null && data.savings_rate != null) {
+          const delta = data.savings_rate - data.comparison_savings_rate;
+          const arrow = delta > 0 ? '↑' : '↓';
+          const cls = delta > 0 ? 'comp-better' : 'comp-worse';
+          cmp.innerHTML = `vs ${data.comparison_savings_rate.toFixed(1)}% <span class="${cls}">${arrow}${Math.abs(delta).toFixed(1)} pp</span>`;
+        }
+      }
+    });
+
+    // Update trend chart spending line
+    if (trendChart && data.trend) {
+      trendChart.data.labels = data.trend.labels;
+      trendChart.data.datasets[0].data = data.trend.spending;
+      trendChart.data.datasets[1].data = data.trend.income;
+      trendChart.update();
+    }
+  }
+
+  if (barEl && categoryData.length > 0) {
+    const top = categoryData.slice(0, 10);
+    const chartH = Math.max(220, top.length * 32 + 40);
+    document.getElementById('bar-container').style.height = chartH + 'px';
+    const donutContainer = document.getElementById('donut-container');
+    if (donutContainer) donutContainer.style.height = chartH + 'px';
+
+    // Custom plugin: draws a vertical tick line at each category's comparison value
+    const comparisonTickPlugin = {
+      id: 'comparisonTick',
+      afterDatasetsDraw(chart) {
+        const compData = chart._compData;
+        if (!compData || !compData.length) return;
+        const { ctx, scales: { x, y } } = chart;
+        const meta = chart.getDatasetMeta(0);
+        ctx.save();
+        compData.forEach((value, i) => {
+          if (!value) return;
+          const bar = meta.data[i];
+          if (!bar) return;
+          const compX = x.getPixelForValue(value);
+          const barH = bar.height;
+          ctx.strokeStyle = 'rgba(220,220,220,0.75)';
+          ctx.lineWidth = 2;
+          ctx.lineCap = 'round';
+          ctx.beginPath();
+          ctx.moveTo(compX, bar.y - barH / 2);
+          ctx.lineTo(compX, bar.y + barH / 2);
+          ctx.stroke();
+        });
+        ctx.restore();
+      },
+    };
+
+    const compMap = () => Object.fromEntries(comparisonCategoryData.map(d => [d.category, d.amount]));
+
+    barChart = new Chart(barEl, {
+      type: 'bar',
+      data: {
+        labels: top.map(d => d.category),
+        datasets: [{
+          data: top.map(d => d.amount),
+          backgroundColor: top.map(d => categoryColor(d.category)),
+          borderRadius: 4,
+          borderSkipped: false,
+          maxBarThickness: 20,
+        }],
+      },
+      plugins: [comparisonTickPlugin],
+      options: {
+        indexAxis: 'y',
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: { duration: 650, easing: 'easeInOutQuart' },
+        layout: { padding: { right: 175 } },
+        onClick: (evt, els) => {
+          if (els.length) {
+            const d = categoryData.slice(0, 10)[els[0].index];
+            if (d) renderDonut(d.category);
+          }
+        },
+        onHover: (evt, els) => {
+          if (evt.native) evt.native.target.style.cursor = els.length ? 'pointer' : 'default';
+        },
+        plugins: {
+          legend: { display: false },
+          datalabels: {
+            anchor: 'end',
+            align: 'end',
+            offset: 6,
+            color: 'rgba(250,250,250,0.55)',
+            font: { size: 11, family: "'IBM Plex Mono', monospace" },
+            formatter: (value, ctx) => {
+              const d = categoryData.slice(0, 10)[ctx.dataIndex];
+              if (!d) return '';
+              return sgd(value) + '  ·  ' + d.tx_count + ' txn' + (d.tx_count !== 1 ? 's' : '');
+            },
+            clamp: true,
+          },
+          tooltip: {
+            ...tooltipStyle,
+            filter: item => item.datasetIndex === 0,
+            callbacks: {
+              title: items => {
+                const d = categoryData.slice(0, 10)[items[0].dataIndex];
+                if (!d) return '';
+                return d.category + '  —  ' + sgd(d.amount) +
+                       '  (' + d.tx_count + ' txn' + (d.tx_count !== 1 ? 's' : '') + ')';
+              },
+              label: () => '',
+              afterBody: items => {
+                const d = categoryData.slice(0, 10)[items[0].dataIndex];
+                if (!d) return [];
+                const txns = categoryDetails[d.category] || [];
+                const lines = txns.map(t => '  ' + t.description + '   ' + sgd(t.amount));
+                if (d.deduction > 0) {
+                  lines.push('');
+                  lines.push('  − ' + sgd(d.deduction) + ' reimbursement offset');
+                }
+                return lines;
+              },
+            },
+          },
+        },
+        scales: {
+          x: {
+            grid: { color: 'rgba(255,255,255,0.05)' },
+            ticks: {
+              callback: v => sgdShort(v),
+              color: 'rgba(250,250,250,0.4)',
+            },
+          },
+          y: {
+            grid: { display: false },
+            ticks: { color: 'rgba(250,250,250,0.6)', font: { size: 11 } },
+          },
+        },
+      },
+    });
+    barChart._compData = top.map(d => compMap()[d.category] ?? 0);
+    renderDonut(null);
+  }
+
+  // ── 2. Line chart — Monthly Spending Trend ───────────────────────────
+  const trendEl = document.getElementById('trend-chart');
+  if (trendEl) {
+    trendChart = new Chart(trendEl, {
+      type: 'line',
+      data: {
+        labels: trendData.labels,
+        datasets: [
+          {
+            label: 'Spending',
+            data: trendData.spending,
+            borderColor: '#ef4444',
+            backgroundColor: 'rgba(239,68,68,0.08)',
+            pointBackgroundColor: '#ef4444',
+            pointRadius: 3,
+            pointHoverRadius: 5,
+            tension: 0.35,
+            fill: true,
+          },
+          {
+            label: 'Income',
+            data: trendData.income,
+            borderColor: '#10b981',
+            backgroundColor: 'rgba(16,185,129,0.08)',
+            pointBackgroundColor: '#10b981',
+            pointRadius: 3,
+            pointHoverRadius: 5,
+            tension: 0.35,
+            fill: true,
+          },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          datalabels: { display: false },
+          legend: {
+            position: 'top',
+            align: 'end',
+            labels: {
+              padding: 20,
+              color: 'rgba(250,250,250,0.7)',
+              usePointStyle: true,
+              pointStyle: 'line',
+            },
+          },
+          tooltip: {
+            ...tooltipStyle,
+            callbacks: {
+              label: ctx => ' ' + ctx.dataset.label + ': ' + sgd(ctx.parsed.y),
+            },
+          },
+        },
+        scales: {
+          x: {
+            grid: { color: 'rgba(255,255,255,0.04)' },
+            ticks: { color: 'rgba(250,250,250,0.4)', font: { size: 11 } },
+          },
+          y: {
+            grid: { color: 'rgba(255,255,255,0.05)' },
+            ticks: {
+              callback: v => sgdShort(v),
+              color: 'rgba(250,250,250,0.4)',
+            },
+          },
+        },
+      },
+    });
+  }
+
+  // Re-render after fonts load to fix legend clipping on first paint
+  document.fonts.ready.then(() => {
+    if (trendChart) trendChart.resize();
+  });
+
+  // ── Reimbursement category tag (AJAX) ───────────────────────────────
+  document.querySelectorAll('.reimb-cat-select').forEach(sel => {
+    sel.addEventListener('change', async function () {
+      const body = new FormData();
+      body.set('category_id', this.value);
+      const res = await fetch('/transactions/' + this.dataset.txid + '/tag-reimbursement',
+        { method: 'POST', body });
+      this.style.transition = 'border-color 0.2s';
+      this.style.borderColor = res.ok ? 'var(--success)' : 'var(--danger)';
+      setTimeout(() => { this.style.borderColor = ''; }, 1200);
+      if (res.ok) fetchAndRefreshCharts();
+    });
+  });
+
+  // ── Split reimbursement modal ─────────────────────────────────────────
+  const splitOverlay   = document.getElementById('split-overlay');
+  const splitDesc      = document.getElementById('split-modal-desc');
+  const splitCatSel    = document.getElementById('split-cat-select');
+  const splitStartEl   = document.getElementById('split-start');
+  const splitEndEl     = document.getElementById('split-end');
+  const splitPreview   = document.getElementById('split-preview');
+  const splitSaveBtn   = document.getElementById('split-save-btn');
+  const splitRemoveBtn = document.getElementById('split-remove-btn');
+  let activeSplitTxId  = null;
+
+  function updateSplitPreview() {
+    const s = splitStartEl.value, e = splitEndEl.value;
+    if (!s || !e || s > e) { splitPreview.textContent = ''; return; }
+    const [sy, sm] = s.split('-').map(Number);
+    const [ey, em] = e.split('-').map(Number);
+    const n = Math.max(1, (ey - sy) * 12 + (em - sm) + 1);
+    const amt = parseFloat(splitDesc.dataset.amount || '0');
+    splitPreview.textContent = `Splits into ${n} month${n > 1 ? 's' : ''} · $${(amt / n).toFixed(2)}/month`;
+  }
+
+  if (splitOverlay) {
+    document.querySelectorAll('.reimb-split-btn').forEach(btn => {
+      btn.addEventListener('click', function () {
+        activeSplitTxId = this.dataset.txid;
+        splitDesc.textContent = this.dataset.desc + ' — +$' + parseFloat(this.dataset.amount).toFixed(2);
+        splitDesc.dataset.amount = this.dataset.amount;
+        splitCatSel.value    = this.dataset.catId || '';
+        splitStartEl.value   = this.dataset.start || '';
+        splitEndEl.value     = this.dataset.end   || '';
+        splitRemoveBtn.hidden = !this.dataset.start;
+        updateSplitPreview();
+        splitOverlay.hidden = false;
+      });
+    });
+
+    splitStartEl.addEventListener('input', updateSplitPreview);
+    splitEndEl.addEventListener('input',   updateSplitPreview);
+
+    document.getElementById('split-cancel-btn').addEventListener('click', () => {
+      splitOverlay.hidden = true;
+    });
+    splitOverlay.addEventListener('click', e => {
+      if (e.target === splitOverlay) splitOverlay.hidden = true;
+    });
+
+    async function submitSplit(catId, start, end) {
+      const body = new FormData();
+      body.set('category_id',       catId);
+      body.set('split_start_month', start);
+      body.set('split_end_month',   end);
+      const res = await fetch('/transactions/' + activeSplitTxId + '/set-split',
+        { method: 'POST', body });
+      if (res.ok) {
+        splitOverlay.hidden = true;
+        await fetchAndRefreshCharts();
+        location.reload();
+      }
+    }
+
+    splitSaveBtn.addEventListener('click', () => {
+      const s = splitStartEl.value, e = splitEndEl.value;
+      if (!splitCatSel.value || !s || !e || s > e) return;
+      submitSplit(splitCatSel.value, s, e);
+    });
+
+    splitRemoveBtn.addEventListener('click', () => {
+      submitSplit('', '', '');
+    });
+  }
+
+})();
+</script>
+
+{% endif %}{# end not empty #}
+{% endblock %}
