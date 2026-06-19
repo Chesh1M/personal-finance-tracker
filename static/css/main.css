@@ -1023,7 +1023,10 @@ input[type="month"].form-input::-webkit-calendar-picker-indicator {
     align-items: flex-start;
   }
   .dash-stat-grid {
-    grid-template-columns: repeat(2, 1fr);
+    grid-template-columns: 1fr;
+  }
+  .stat-card {
+    min-height: unset;
   }
   .stat-value {
     font-size: 1.4rem;
@@ -1031,8 +1034,43 @@ input[type="month"].form-input::-webkit-calendar-picker-indicator {
   .dash-chart-row {
     grid-template-columns: 1fr !important;
   }
+  .month-filter-form {
+    width: 100%;
+  }
+  .month-filter-select {
+    flex: 1;
+  }
+  .account-balance-row {
+    flex-wrap: wrap;
+  }
+  .acct-compare {
+    flex-basis: 100%;
+    text-align: right;
+    padding-bottom: 0.2rem;
+  }
+  /* Net bank total inner div: wrap compare below amount */
+  .account-balance-total > div {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+  .reimb-row {
+    flex-wrap: wrap;
+    row-gap: 0.3rem;
+  }
+  .reimb-desc {
+    flex-basis: 100%;
+  }
+  .reimb-amount {
+    margin-left: auto;
+  }
 }
 @media (min-width: 601px) and (max-width: 900px) {
+  .nav-links {
+    display: none;
+  }
+  .nav-hamburger {
+    display: flex;
+  }
   .dash-stat-grid {
     grid-template-columns: repeat(2, 1fr);
   }

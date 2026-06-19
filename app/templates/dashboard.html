@@ -596,6 +596,8 @@
 
     const compMap = () => Object.fromEntries(comparisonCategoryData.map(d => [d.category, d.amount]));
 
+    const isMobile = window.innerWidth <= 600;
+    const maxVal = top.length > 0 ? Math.max(...top.map(d => d.amount)) : 100;
     barChart = new Chart(barEl, {
       type: 'bar',
       data: {
@@ -614,7 +616,7 @@
         responsive: true,
         maintainAspectRatio: false,
         animation: { duration: 650, easing: 'easeInOutQuart' },
-        layout: { padding: { right: 175 } },
+        layout: { padding: 0 },
         onClick: (evt, els) => {
           if (els.length) {
             const d = categoryData.slice(0, 10)[els[0].index];
@@ -631,10 +633,11 @@
             align: 'end',
             offset: 6,
             color: 'rgba(250,250,250,0.55)',
-            font: { size: 11, family: "'IBM Plex Mono', monospace" },
+            font: { size: isMobile ? 9 : 11, family: "'IBM Plex Mono', monospace" },
             formatter: (value, ctx) => {
               const d = categoryData.slice(0, 10)[ctx.dataIndex];
               if (!d) return '';
+              if (isMobile) return sgd(value);
               return sgd(value) + '  ·  ' + d.tx_count + ' txn' + (d.tx_count !== 1 ? 's' : '');
             },
             clamp: true,
@@ -666,6 +669,7 @@
         },
         scales: {
           x: {
+            suggestedMax: maxVal * 1.4,
             grid: { color: 'rgba(255,255,255,0.05)' },
             ticks: {
               callback: v => sgdShort(v),
@@ -674,7 +678,8 @@
           },
           y: {
             grid: { display: false },
-            ticks: { color: 'rgba(250,250,250,0.6)', font: { size: 11 } },
+            ticks: { color: 'rgba(250,250,250,0.6)', font: { size: isMobile ? 9 : 11 } },
+            afterFit: isMobile ? (axis) => { axis.width = Math.max(axis.width, 75); } : undefined,
           },
         },
       },
