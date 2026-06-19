@@ -9,4 +9,8 @@ if (navToggle && navMobileMenu) {
   navMobileMenu.querySelectorAll("a").forEach((link) => {
     link.addEventListener("click", () => navMobileMenu.classList.remove("open"));
   });
+  // Close menu when resized out of hamburger breakpoint
+  window.addEventListener("resize", () => {
+    if (window.innerWidth > 900) navMobileMenu.classList.remove("open");
+  });
 }
