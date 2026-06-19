@@ -263,6 +263,13 @@
     <div id="bar-container" style="position:relative;">
       <canvas id="bar-chart" role="img" aria-label="Category spending bar chart"></canvas>
     </div>
+    <div id="bar-drill-panel" class="bar-drill-panel" hidden>
+      <div class="bar-drill-header">
+        <span id="bar-drill-title" class="bar-drill-title"></span>
+        <button class="bar-drill-close" id="bar-drill-close" aria-label="Close">×</button>
+      </div>
+      <div id="bar-drill-body" class="bar-drill-body"></div>
+    </div>
   </div>
   <div class="dash-chart-card">
     <div class="donut-card-header">
@@ -620,7 +627,7 @@
         onClick: (evt, els) => {
           if (els.length) {
             const d = categoryData.slice(0, 10)[els[0].index];
-            if (d) renderDonut(d.category);
+            if (d) { renderDonut(d.category); showBarDetail(d); }
           }
         },
         onHover: (evt, els) => {
@@ -642,30 +649,7 @@
             },
             clamp: true,
           },
-          tooltip: {
-            ...tooltipStyle,
-            filter: item => item.datasetIndex === 0,
-            callbacks: {
-              title: items => {
-                const d = categoryData.slice(0, 10)[items[0].dataIndex];
-                if (!d) return '';
-                return d.category + '  —  ' + sgd(d.amount) +
-                       '  (' + d.tx_count + ' txn' + (d.tx_count !== 1 ? 's' : '') + ')';
-              },
-              label: () => '',
-              afterBody: items => {
-                const d = categoryData.slice(0, 10)[items[0].dataIndex];
-                if (!d) return [];
-                const txns = categoryDetails[d.category] || [];
-                const lines = txns.map(t => '  ' + t.description + '   ' + sgd(t.amount));
-                if (d.deduction > 0) {
-                  lines.push('');
-                  lines.push('  − ' + sgd(d.deduction) + ' reimbursement offset');
-                }
-                return lines;
-              },
-            },
-          },
+          tooltip: { enabled: false },
         },
         scales: {
           x: {
@@ -686,6 +670,28 @@
     });
     barChart._compData = top.map(d => compMap()[d.category] ?? 0);
     renderDonut(null);
+
+    document.getElementById('bar-drill-close').addEventListener('click', () => {
+      document.getElementById('bar-drill-panel').hidden = true;
+    });
+  }
+
+  function showBarDetail(d) {
+    const txns = categoryDetails[d.category] || [];
+    document.getElementById('bar-drill-title').textContent =
+      d.category + ' — ' + sgd(d.amount) + ' (' + d.tx_count + ' txn' + (d.tx_count !== 1 ? 's' : '') + ')';
+    const body = document.getElementById('bar-drill-body');
+    body.innerHTML = txns.map(t =>
+      '<div class="bar-drill-row">' +
+      '<span class="bar-drill-desc">' + t.description + '</span>' +
+      '<span class="bar-drill-amt">' + sgd(t.amount) + '</span>' +
+      '</div>'
+    ).join('');
+    if (d.deduction > 0) {
+      body.innerHTML +=
+        '<div class="bar-drill-deduction">− ' + sgd(d.deduction) + ' reimbursement offset</div>';
+    }
+    document.getElementById('bar-drill-panel').hidden = false;
   }
 
   // ── 2. Line chart — Monthly Spending Trend ───────────────────────────
