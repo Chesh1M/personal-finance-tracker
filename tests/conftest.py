@@ -9,5 +9,7 @@ os.environ.setdefault("GOOGLE_CLIENT_SECRET", "test-client-secret")
 
 # Create all tables in the test database (CI has no finance_tracker.db or
 # alembic migration step, so we bootstrap the schema from the ORM models).
+# app.models must be imported first so the ORM classes register with Base.metadata.
+import app.models  # noqa: F401, E402
 from app.database import Base, engine  # noqa: E402
 Base.metadata.create_all(engine)
