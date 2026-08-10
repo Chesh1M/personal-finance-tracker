@@ -666,28 +666,10 @@ def parse_statement(pdf_path: str, bank_source: str) -> dict:
 
     if all_rows and field_names:
         table_csv = _rows_to_csv(all_rows, field_names)
-
-        # Pre-compute authoritative type/amount from Stage 2 column positions.
-        # GPT-4o-mini (Stage 3) can misassign type based on description context;
-        # we override its output with the deterministic values from the CSV columns.
-        anchor_overrides: list[tuple[str, float]] = []
-        for row in all_rows:
-            dv = row.get("debit", "")
-            cv = row.get("credit", "")
-            if _is_money_value(dv):
-                anchor_overrides.append(("debit", float(dv.replace(",", ""))))
-            elif _is_money_value(cv):
-                anchor_overrides.append(("credit", float(cv.replace(",", ""))))
-            # Continuation lines and balance-marker rows produce no anchor entry
-
-        result = _parse_csv_with_gpt(table_csv, bank_source)
-
-        txns = result.get("transactions", [])
-        for tx, (tx_type, tx_amount) in zip(txns, anchor_overrides):
-            tx["type"] = tx_type
-            tx["amount"] = tx_amount
-
-        return result
+        # Stage 3 reads type and amount directly from the labelled debit/credit
+        # columns — no positional override needed (and positional zipping breaks
+        # whenever Stage 3 skips or merges a row, causing misalignment).
+        return _parse_csv_with_gpt(table_csv, bank_source)
 
     # Fallback: no tabular pages found → Vision extraction
     return _parse_statement_vision_fallback(pdf_path, bank_source)

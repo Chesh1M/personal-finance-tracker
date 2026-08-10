@@ -199,12 +199,15 @@ def upload_page(
         totals_map.setdefault(row.statement_id, {})
         totals_map[row.statement_id][row.type] = row.total
 
+    processing_ids = [s.id for s in statements if s.status == "processing"]
+
     return templates.TemplateResponse(request, "upload.html", {
         "banks": SUPPORTED_BANKS,
         "statements": statements,
         "skipped_map": skipped_map,
         "totals_map": totals_map,
         "current_user": current_user,
+        "processing_ids": processing_ids,
     })
 
 

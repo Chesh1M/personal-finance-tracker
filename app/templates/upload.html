@@ -15,7 +15,7 @@
 {% if request.query_params.get('balance_extracted') %}
 <div class="alert alert-success">Balance extraction complete — check the Closing Balance column below.</div>
 {% endif %}
-{% if request.query_params.get('processing') %}
+{% if request.query_params.get('processing') or processing_ids %}
 <div class="alert alert-info" id="processing-banner">
   <span class="spinner-inline"></span>
   <strong>Processing your statement…</strong>
@@ -23,7 +23,10 @@
 </div>
 {% endif %}
 {% if request.query_params.get('failed') %}
-<div class="alert alert-error"><strong>Processing failed.</strong> The statement could not be parsed. Check your PDF and try again.</div>
+<div class="alert alert-error">
+  <strong>Processing failed.</strong> The statement could not be parsed. Check your PDF and try again.
+  If you uploaded just now and the page reloaded unexpectedly, check the table below — it may have processed successfully in the background.
+</div>
 {% endif %}
 
 <div class="card">
@@ -229,25 +232,40 @@
   });
 
   // ── Background processing poll ─────────────────────────────────────────────
-  // If ?processing=<id> is in the URL, poll until status changes.
-  const processingId = new URLSearchParams(location.search).get('processing');
-  if (processingId) {
-    const banner = document.getElementById('processing-banner');
-    const pollInterval = setInterval(async () => {
-      try {
-        const res = await fetch(`/upload/status/${processingId}`);
-        if (!res.ok) { clearInterval(pollInterval); return; }
-        const data = await res.json();
+  // Collect IDs to poll: either the ?processing=<id> query param (fresh upload)
+  // or any statements already in "processing" state when the page loads (handles
+  // the Render cold-start case where the browser got a 502 but the upload
+  // actually reached the server and is running in the background).
+  const qpId = new URLSearchParams(location.search).get('processing');
+  const serverIds = {{ processing_ids | tojson }};
+  const idsToWatch = qpId
+    ? [parseInt(qpId, 10)]
+    : serverIds;
 
-        if (data.status === 'completed') {
-          clearInterval(pollInterval);
-          location.href = `/review?new=1&inserted=${data.inserted}&skipped=${data.skipped}`;
-        } else if (data.status === 'failed') {
-          clearInterval(pollInterval);
-          location.href = '/upload?failed=1';
-        }
-        // status === 'processing' → keep polling
-      } catch (_) { /* network hiccup — retry next tick */ }
+  if (idsToWatch.length > 0) {
+    // Poll all in-progress statements; redirect to review when first one completes.
+    let resolved = false;
+    const pollInterval = setInterval(async () => {
+      if (resolved) { clearInterval(pollInterval); return; }
+      for (const id of idsToWatch) {
+        try {
+          const res = await fetch(`/upload/status/${id}`);
+          if (!res.ok) continue;
+          const data = await res.json();
+          if (data.status === 'completed') {
+            resolved = true;
+            clearInterval(pollInterval);
+            location.href = `/review?new=1&inserted=${data.inserted}&skipped=${data.skipped}`;
+            return;
+          } else if (data.status === 'failed') {
+            resolved = true;
+            clearInterval(pollInterval);
+            location.href = '/upload?failed=1';
+            return;
+          }
+          // status === 'processing' → keep polling
+        } catch (_) { /* network hiccup — retry next tick */ }
+      }
     }, 3000);
   }
 </script>
