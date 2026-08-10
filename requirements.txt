@@ -2,7 +2,7 @@ fastapi
 uvicorn[standard]
 sqlalchemy
 alembic
-pdfplumber
+pymupdf
 openai
 yfinance
 jinja2

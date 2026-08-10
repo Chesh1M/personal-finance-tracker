@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from fastapi import FastAPI, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from slowapi import _rate_limit_exceeded_handler
@@ -56,6 +56,28 @@ app.include_router(balances.router)
 # Routers added as phases are completed:
 # from app.routers import portfolio
 # app.include_router(portfolio.router)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """Last-resort handler so unhandled exceptions never show a blank page."""
+    is_production = os.getenv("ENVIRONMENT", "development") == "production"
+    detail = "An unexpected error occurred. Please try again." if is_production else str(exc)
+    html = f"""<!doctype html><html lang="en">
+<head><meta charset="utf-8"><title>Error — Finance Tracker</title>
+<style>
+  body{{margin:0;background:#09090b;color:#fafafa;font-family:'IBM Plex Sans',system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;}}
+  .card{{background:#111113;border:1px solid #27272a;border-radius:12px;padding:2rem 2.5rem;max-width:480px;text-align:center;}}
+  h1{{color:#ef4444;font-size:1.25rem;margin:0 0 0.75rem;}}
+  p{{color:#a1a1aa;margin:0 0 1.5rem;font-size:0.9rem;line-height:1.6;}}
+  a{{color:#0C5CAB;text-decoration:none;font-size:0.9rem;}}a:hover{{text-decoration:underline;}}
+</style></head>
+<body><div class="card">
+  <h1>Something went wrong</h1>
+  <p>{detail}</p>
+  <a href="/">&larr; Back to Dashboard</a>
+</div></body></html>"""
+    return HTMLResponse(content=html, status_code=500)
 
 
 @app.get("/health")

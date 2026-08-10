@@ -16,9 +16,8 @@ from app.limiter import limiter
 from app.models import StatementUpload, Transaction, User
 from app.services.pdf_parser import (
     compute_transaction_hash,
-    extract_text_from_pdf,
     parse_date,
-    parse_statement_with_gpt,
+    parse_statement,
 )
 
 router = APIRouter(tags=["upload"])
@@ -41,10 +40,23 @@ SUPPORTED_BANKS = [
 
 
 def _error_page(request: Request, db: Session, error: str, status_code: int = 400, current_user=None):
-    statements = db.query(StatementUpload).order_by(StatementUpload.upload_date.desc()).all()
+    try:
+        query = db.query(StatementUpload)
+        if current_user:
+            query = query.filter(StatementUpload.user_id == current_user.id)
+        statements = query.order_by(StatementUpload.upload_date.desc()).all()
+    except Exception:
+        statements = []
     return templates.TemplateResponse(
         request, "upload.html",
-        {"banks": SUPPORTED_BANKS, "statements": statements, "error": error, "current_user": current_user},
+        {
+            "banks": SUPPORTED_BANKS,
+            "statements": statements,
+            "error": error,
+            "current_user": current_user,
+            "skipped_map": {},
+            "totals_map": {},
+        },
         status_code=status_code,
     )
 
@@ -136,12 +148,8 @@ async def upload_statement(
     db.refresh(statement)
 
     try:
-        # Step 1: Extract raw text from PDF
-        raw_text = extract_text_from_pdf(str(save_path))
-        statement.raw_text = raw_text
-
-        # Step 2: Parse transactions (+ closing balance) with GPT
-        parsed = parse_statement_with_gpt(raw_text, bank_source)
+        # Step 1: Parse transactions (+ closing balance) via GPT-4o Vision
+        parsed = parse_statement(str(save_path), bank_source)
         statement.closing_balance = parsed.get("closing_balance")
         statement.account_type    = parsed.get("account_type")
 
@@ -239,25 +247,6 @@ async def upload_statement(
             error_msg = str(e)
         return _error_page(request, db, error_msg, status_code=500, current_user=current_user)
 
-
-@router.post("/statements/{statement_id}/extract-balance")
-def extract_statement_balance(
-    statement_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """Re-run GPT on stored raw_text to extract the closing balance and account_type.
-    Safe to call on existing statements without re-uploading the PDF."""
-    statement = db.query(StatementUpload).filter(
-        StatementUpload.id == statement_id,
-        StatementUpload.user_id == current_user.id,
-    ).first()
-    if statement and statement.raw_text:
-        result = parse_statement_with_gpt(statement.raw_text, statement.bank_source)
-        statement.closing_balance = result.get("closing_balance")
-        statement.account_type    = result.get("account_type")
-        db.commit()
-    return RedirectResponse(url="/upload?balance_extracted=1", status_code=303)
 
 
 @router.post("/statements/{statement_id}/recategorize")
