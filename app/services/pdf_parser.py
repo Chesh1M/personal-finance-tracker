@@ -65,7 +65,9 @@ def _clean_date_field(s: str) -> str:
 import pymupdf as fitz
 from openai import OpenAI
 
-client = OpenAI()
+# 90-second timeout per call. OpenAI default is 600s — a hung Vision request
+# would otherwise block the background thread for up to 10 minutes silently.
+client = OpenAI(timeout=90.0)
 
 # ── Stage 1: Vision layout-detection schema ───────────────────────────────────
 _LAYOUT_SYSTEM_PROMPT = """You are a bank statement layout analyser.

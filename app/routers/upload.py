@@ -1,7 +1,13 @@
 import json
+import logging
 import os
-from datetime import datetime, timezone
+import traceback
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+_PROCESSING_TIMEOUT = timedelta(minutes=10)
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -152,12 +158,13 @@ def _process_statement_background(
             batch_categorize_transactions(statement_id, db)
 
     except Exception:
+        logger.error("Background parse failed for statement %d:\n%s", statement_id, traceback.format_exc())
         if statement is not None:
             try:
                 statement.status = "failed"
                 db.commit()
             except Exception:
-                pass
+                logger.error("Could not mark statement %d as failed", statement_id, exc_info=True)
         try:
             Path(save_path).unlink(missing_ok=True)
         except OSError:
@@ -224,16 +231,33 @@ def get_statement_status(
     if not statement:
         return JSONResponse({"status": "not_found"}, status_code=404)
 
+    # Auto-expire stuck processing statements so the UI doesn't wait forever.
+    if statement.status == "processing":
+        upload_dt = statement.upload_date
+        if upload_dt.tzinfo is None:
+            upload_dt = upload_dt.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) - upload_dt > _PROCESSING_TIMEOUT:
+            statement.status = "failed"
+            try:
+                db.commit()
+            except Exception:
+                pass
+
     inserted = db.query(func.count(Transaction.id)).filter(
         Transaction.statement_id == statement_id,
         Transaction.user_id == current_user.id,
     ).scalar() or 0
     skipped = len(json.loads(statement.skipped_json or "[]"))
 
+    upload_dt = statement.upload_date
+    if upload_dt.tzinfo is None:
+        upload_dt = upload_dt.replace(tzinfo=timezone.utc)
+
     return JSONResponse({
         "status": statement.status,
         "inserted": inserted,
         "skipped": skipped,
+        "started_at": upload_dt.isoformat(),
     })
 
 

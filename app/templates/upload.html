@@ -18,8 +18,11 @@
 {% if request.query_params.get('processing') or processing_ids %}
 <div class="alert alert-info" id="processing-banner">
   <span class="spinner-inline"></span>
-  <strong>Processing your statement…</strong>
-  Extracting and categorizing transactions in the background. This page will update automatically when done.
+  <span>
+    <strong>Processing your statement…</strong>
+    <span id="processing-detail" style="margin-left:0.3rem; opacity:0.8;">Extracting and categorizing transactions in the background.</span>
+    <span id="processing-elapsed" style="margin-left:0.5rem; font-family:'IBM Plex Mono',monospace; font-size:0.82rem; opacity:0.65;"></span>
+  </span>
 </div>
 {% endif %}
 {% if request.query_params.get('failed') %}
@@ -245,21 +248,41 @@
   if (idsToWatch.length > 0) {
     // Poll all in-progress statements; redirect to review when first one completes.
     let resolved = false;
+    let startedAt = null;
+    const elapsedEl = document.getElementById('processing-elapsed');
+
+    function fmtElapsed(ms) {
+      const s = Math.floor(ms / 1000);
+      if (s < 60) return `${s}s`;
+      return `${Math.floor(s / 60)}m ${s % 60}s`;
+    }
+
+    function tickElapsed() {
+      if (startedAt && elapsedEl) {
+        elapsedEl.textContent = `(${fmtElapsed(Date.now() - startedAt)})`;
+      }
+    }
+    const elapsedTimer = setInterval(tickElapsed, 1000);
+
     const pollInterval = setInterval(async () => {
-      if (resolved) { clearInterval(pollInterval); return; }
+      if (resolved) { clearInterval(pollInterval); clearInterval(elapsedTimer); return; }
       for (const id of idsToWatch) {
         try {
           const res = await fetch(`/upload/status/${id}`);
           if (!res.ok) continue;
           const data = await res.json();
+          if (data.started_at && !startedAt) {
+            startedAt = new Date(data.started_at).getTime();
+            tickElapsed();
+          }
           if (data.status === 'completed') {
             resolved = true;
-            clearInterval(pollInterval);
+            clearInterval(pollInterval); clearInterval(elapsedTimer);
             location.href = `/review?new=1&inserted=${data.inserted}&skipped=${data.skipped}`;
             return;
           } else if (data.status === 'failed') {
             resolved = true;
-            clearInterval(pollInterval);
+            clearInterval(pollInterval); clearInterval(elapsedTimer);
             location.href = '/upload?failed=1';
             return;
           }
