@@ -12,6 +12,8 @@ _MONEY_RE = _re.compile(r"^\d[\d,]*\.\d{2}$")
 _NON_TXN_DESCS = (
     "balance brought forward", "balance b/f", "balance c/f",
     "opening balance", "closing balance", "balance carried forward",
+    "total balance carried forward", "total balance",
+    "total debits", "total credits",
 )
 
 _DATE_RE = _re.compile(
@@ -23,6 +25,29 @@ _DATE_RE = _re.compile(
 def _is_money_value(s: str) -> bool:
     """Return True if s looks like a monetary amount (e.g. '1.40', '3,487.30')."""
     return bool(_MONEY_RE.match(s.strip())) if s else False
+
+
+def _compute_row_spacing(below: list, col_defs: list[dict]) -> float:
+    """Estimate row spacing from balance-column monetary value y-centers.
+
+    Uses only balance-column words so multi-word description lines don't skew the median.
+    Returns 0.0 if there are fewer than 3 balance values (can't estimate reliably).
+    """
+    balance_col = next((c for c in col_defs if c["field"] == "balance"), None)
+    if not balance_col:
+        return 0.0
+    bal_ys = sorted([
+        (w[1] + w[3]) / 2
+        for w in below
+        if balance_col["x_start"] <= (w[0] + w[2]) / 2 < balance_col["x_end"]
+        and _MONEY_RE.match(w[4].strip())
+    ])
+    if len(bal_ys) < 3:
+        return 0.0
+    gaps = [bal_ys[i + 1] - bal_ys[i]
+            for i in range(len(bal_ys) - 1)
+            if bal_ys[i + 1] - bal_ys[i] > 1.5]
+    return sorted(gaps)[len(gaps) // 2] if gaps else 0.0
 
 
 def _has_date_value(s: str) -> bool:
@@ -58,9 +83,11 @@ Field values for 'field':
 - "balance": running account balance (NOT a transaction amount)
 - "other": any column that does not fit the above
 
-If the page contains a transaction table, also return table_bbox as [x0, y0, x1, y1] pixel coordinates
-of the full transaction table area in the rendered page image (include the header row, exclude page
-header/footer text outside the table). Return null for table_bbox if has_transaction_table is false."""
+If the page contains a transaction table, return table_bbox as [x0, y0, x1, y1] pixel coordinates
+in the rendered image. The bbox must span from the TOP of the column header row down to the BOTTOM
+of the LAST transaction data row — include the entire table body, not just the header. Exclude any
+page footers, page numbers, or summary tables (e.g. "Total Balance Carried Forward") that appear
+below the last transaction row. Return null for table_bbox if has_transaction_table is false."""
 
 _LAYOUT_SCHEMA = {
     "type": "json_schema",
@@ -126,13 +153,19 @@ Rules:
 - transaction_date: YYYY-MM-DD or null
 - type: "debit" if value came from the debit column, "credit" if from the credit column
 - is_transfer: true for wallet top-ups, own-account transfers, credit card bill payments
-- reference_id: transaction reference number if visible in description, else null
+- reference_id: if a standalone numeric reference (8+ digits, not a card or account number)
+  appears in the description, extract it here; null if none
 - account_type: infer from context — one of "savings", "current", "credit_card", "paylah", "other"
 - closing_balance: the last balance value in the balance column, or null if not available
+- description: merchant or narrative text only. Preserve the type prefix (e.g. "Debit Card
+  Transaction", "FAST Payment / Receipt", "Salary"). Strip card numbers (patterns like
+  "4628-4500-4754-4953"), bank registration codes (e.g. "SG400..."), page footer text
+  ("Transaction Details as of...", "Page X of Y"), and any technical identifiers or trailing
+  noise that is not part of the merchant name.
 - Rows with no date are continuation lines — merge description with the preceding transaction
-- Skip non-transaction rows: balance markers ("Balance Brought Forward", "Balance B/F", "Balance C/F"),
-  totals ("Total Balance Carried Forward", "Total Debits/Credits"), and any summary row where the
-  description signals a period summary rather than a merchant or payee"""
+- Skip non-transaction rows: balance markers ("Balance Brought Forward", "Balance B/F",
+  "Balance C/F"), totals ("Total Balance Carried Forward", "Total Debits/Credits"), and any
+  summary row where the description signals a period summary rather than a merchant or payee"""
 
 # ── Vision fallback: all pages as images → gpt-4o (original approach) ────────
 SYSTEM_PROMPT = """You are a financial data extractor for Singapore bank statements.
@@ -318,8 +351,10 @@ def _detect_layout(images: list[str], all_text_lines: list[list[dict]]) -> dict:
 def _match_header_line(header_text: str, text_lines: list[dict]) -> dict | None:
     """Find the text line that best matches a column header string.
 
-    Tries exact match, then first-word match, then substring match.
-    Case-insensitive; strips parentheses and punctuation for comparison.
+    Collects all candidates (exact, first-word, substring), then returns the one
+    closest to the top of the page. This ensures column headers at the top of the
+    table are preferred over any body or footer text that happens to contain the
+    same word (e.g. "Balance Brought Forward" matching a "Balance" column lookup).
     """
     def normalise(s: str) -> str:
         return _re.sub(r"[^a-z0-9 ]", "", s.lower()).strip()
@@ -327,22 +362,22 @@ def _match_header_line(header_text: str, text_lines: list[dict]) -> dict | None:
     target = normalise(header_text)
     target_first = target.split()[0] if target else ""
 
+    candidates: list[tuple[int, dict]] = []
     for line in text_lines:
         norm = normalise(line["text"])
         if norm == target:
-            return line
+            candidates.append((0, line))
+        elif target_first and norm == target_first:
+            candidates.append((1, line))
+        elif target and (target in norm or norm in target):
+            candidates.append((2, line))
 
-    for line in text_lines:
-        norm = normalise(line["text"])
-        if target_first and norm == target_first:
-            return line
+    if not candidates:
+        return None
 
-    for line in text_lines:
-        norm = normalise(line["text"])
-        if target in norm or norm in target:
-            return line
-
-    return None
+    # Sort by y-center ascending (prefer topmost match), then by match quality.
+    candidates.sort(key=lambda c: ((c[1]["y0"] + c[1]["y1"]) / 2, c[0]))
+    return candidates[0][1]
 
 
 def _find_column_boundaries(
@@ -411,6 +446,22 @@ def _extract_rows_from_page(
     if not below:
         return []
 
+    # Adaptive y_tol from balance-column monetary values only.
+    # One value per row → gaps equal row spacing (no multi-word description noise).
+    row_spacing = _compute_row_spacing(below, col_defs)
+    if row_spacing > 0:
+        y_tol = min(max(row_spacing * 0.8, 4.0), 10.0)
+
+    # Hard cutoff: when Vision's table_bbox accurately marks the end of a short table
+    # (top 35% of the page), exclude words whose bottom edge is below that bound.
+    # For full-page tables Vision undershoots table_y_end (~40% of actual height),
+    # so the filter is skipped to avoid truncating real transactions.
+    page_height = page.rect.height
+    if table_y_end is not None and page_height > 0 and table_y_end / page_height < 0.35:
+        below = [w for w in below if w[3] < table_y_end]
+        if not below:
+            return []
+
     money_fields = {"debit", "credit", "balance"}
 
     # Group into visual rows by y-center proximity with a money-column collision guard.
@@ -466,12 +517,17 @@ def _extract_rows_from_page(
         has_money   = has_debit or has_credit or has_balance
         has_date    = date_col_exists and _has_date_value(row_dict.get("date", ""))
 
-        # Drop pure balance-marker rows (no debit, credit, or date — only a balance).
-        # Only drop if the description is empty or matches a known non-transaction phrase,
-        # so real transactions whose amount failed validation are never silently removed.
+        desc_lower = row_dict.get("description", "").strip().lower()
+
+        # Description-first filter: drop any known non-transaction summary row regardless
+        # of whether it has monetary values (catches "Total Balance Carried Forward" which
+        # has debit+credit+balance totals and would otherwise become a fake anchor row).
+        if desc_lower and any(kw in desc_lower for kw in _NON_TXN_DESCS):
+            continue
+
+        # Drop pure balance-marker rows with no debit/credit/date and no description.
         if has_balance and not has_debit and not has_credit and not has_date:
-            desc_lower = row_dict.get("description", "").strip().lower()
-            if not desc_lower or any(kw in desc_lower for kw in _NON_TXN_DESCS):
+            if not desc_lower:
                 continue
 
         if has_money or has_date:
