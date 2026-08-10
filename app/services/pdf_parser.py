@@ -147,13 +147,17 @@ You will receive a CSV table extracted from a bank statement. The columns are al
 - "debit": amount leaving the account (always a debit)
 - "credit": amount entering the account (always a credit)
 - "balance": running account balance — never use this as a transaction amount
+- "_type": pre-computed from which of debit/credit has a value — ALWAYS copy this directly
+  to the type field; never override it based on description text
+- "_amount": pre-computed positive float matching _type — ALWAYS copy this to the amount field;
+  never use the balance column value as the amount
 
 Rules:
 - Extract EVERY transaction row — do not skip any
-- amount: always a positive float (use the debit or credit value, not balance)
+- type: copy _type exactly ("debit" or "credit") — do not infer from description
+- amount: parse _amount as a positive float — do not read from balance column
 - date: YYYY-MM-DD
 - transaction_date: YYYY-MM-DD or null
-- type: "debit" if value came from the debit column, "credit" if from the credit column
 - is_transfer: true for wallet top-ups, own-account transfers, credit card bill payments
 - reference_id: if a standalone numeric reference (8+ digits, not a card or account number)
   appears in the description, extract it here; null if none
@@ -667,10 +671,23 @@ def parse_statement(pdf_path: str, bank_source: str) -> dict:
     doc_for_extract.close()
 
     if all_rows and field_names:
-        table_csv = _rows_to_csv(all_rows, field_names)
-        # Stage 3 reads type and amount directly from the labelled debit/credit
-        # columns — no positional override needed (and positional zipping breaks
-        # whenever Stage 3 skips or merges a row, causing misalignment).
+        # Embed pre-computed type/amount from Stage 2 column positions directly
+        # into the CSV. Each row carries its own _type/_amount so Stage 3 never
+        # needs to infer them — no positional alignment, no GPT guessing.
+        for row in all_rows:
+            dv = row.get("debit", "")
+            cv = row.get("credit", "")
+            if _is_money_value(dv):
+                row["_type"] = "debit"
+                row["_amount"] = dv
+            elif _is_money_value(cv):
+                row["_type"] = "credit"
+                row["_amount"] = cv
+            else:
+                row["_type"] = ""
+                row["_amount"] = ""
+
+        table_csv = _rows_to_csv(all_rows, field_names + ["_type", "_amount"])
         return _parse_csv_with_gpt(table_csv, bank_source)
 
     # Fallback: no tabular pages found → Vision extraction
