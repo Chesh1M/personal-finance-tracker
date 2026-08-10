@@ -15,6 +15,16 @@
 {% if request.query_params.get('balance_extracted') %}
 <div class="alert alert-success">Balance extraction complete — check the Closing Balance column below.</div>
 {% endif %}
+{% if request.query_params.get('processing') %}
+<div class="alert alert-info" id="processing-banner">
+  <span class="spinner-inline"></span>
+  <strong>Processing your statement…</strong>
+  Extracting and categorizing transactions in the background. This page will update automatically when done.
+</div>
+{% endif %}
+{% if request.query_params.get('failed') %}
+<div class="alert alert-error"><strong>Processing failed.</strong> The statement could not be parsed. Check your PDF and try again.</div>
+{% endif %}
 
 <div class="card">
   <form method="post" action="/upload" enctype="multipart/form-data" id="upload-form">
@@ -108,7 +118,18 @@
               <span style="color:var(--text-muted);">—</span>
             {% endif %}
           </td>
-          <td><span class="badge badge-{{ 'credit' if s.status == 'completed' else ('spending' if s.status == 'processing' else 'debit') }}">{{ s.status }}</span></td>
+          <td>
+            {% if s.status == 'processing' %}
+            <span class="badge badge-spending" style="display:inline-flex; align-items:center; gap:0.35rem;">
+              <span class="spinner-inline" style="width:0.7rem; height:0.7rem;"></span>
+              processing
+            </span>
+            {% elif s.status == 'completed' %}
+            <span class="badge badge-credit">completed</span>
+            {% else %}
+            <span class="badge badge-debit">{{ s.status }}</span>
+            {% endif %}
+          </td>
           <td>
             <div style="display:flex; gap:0.5rem; align-items:center;">
               {%- if s.status == 'completed' and s.raw_text %}
@@ -166,6 +187,7 @@
 {% endif %}
 
 <script>
+  // ── Drop-zone ──────────────────────────────────────────────────────────────
   const dropZone = document.getElementById('drop-zone');
   const fileInput = document.getElementById('file');
   const filenameEl = document.getElementById('drop-zone-filename');
@@ -195,6 +217,7 @@
     });
   });
 
+  // ── Upload form: disable submit & show brief uploading state ───────────────
   document.getElementById('upload-form').addEventListener('submit', function () {
     const btn = document.getElementById('submit-btn');
     const progress = document.getElementById('upload-progress');
@@ -202,9 +225,30 @@
     btn.textContent = 'Uploading…';
     btn.disabled = true;
     progress.classList.add('active');
-    status.textContent = 'Extracting text from PDF…';
-    setTimeout(() => { status.textContent = 'Parsing transactions with AI… this may take 15–30 seconds.'; }, 4000);
-    setTimeout(() => { status.textContent = 'Auto-categorizing transactions…'; }, 25000);
+    status.textContent = 'Uploading PDF…';
   });
+
+  // ── Background processing poll ─────────────────────────────────────────────
+  // If ?processing=<id> is in the URL, poll until status changes.
+  const processingId = new URLSearchParams(location.search).get('processing');
+  if (processingId) {
+    const banner = document.getElementById('processing-banner');
+    const pollInterval = setInterval(async () => {
+      try {
+        const res = await fetch(`/upload/status/${processingId}`);
+        if (!res.ok) { clearInterval(pollInterval); return; }
+        const data = await res.json();
+
+        if (data.status === 'completed') {
+          clearInterval(pollInterval);
+          location.href = `/review?new=1&inserted=${data.inserted}&skipped=${data.skipped}`;
+        } else if (data.status === 'failed') {
+          clearInterval(pollInterval);
+          location.href = '/upload?failed=1';
+        }
+        // status === 'processing' → keep polling
+      } catch (_) { /* network hiccup — retry next tick */ }
+    }, 3000);
+  }
 </script>
 {% endblock %}

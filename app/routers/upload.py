@@ -1,24 +1,18 @@
 import json
 import os
-import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
-from fastapi.responses import RedirectResponse
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Request, UploadFile
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.database import get_db
+from app.database import SessionLocal, get_db
 from app.dependencies import get_current_user
 from app.limiter import limiter
 from app.models import StatementUpload, Transaction, User
-from app.services.pdf_parser import (
-    compute_transaction_hash,
-    parse_date,
-    parse_statement,
-)
 
 router = APIRouter(tags=["upload"])
 templates = Jinja2Templates(directory=Path(__file__).resolve().parent.parent / "templates")
@@ -61,113 +55,41 @@ def _error_page(request: Request, db: Session, error: str, status_code: int = 40
     )
 
 
-@router.get("/upload")
-def upload_page(
-    request: Request,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    statements = (
-        db.query(StatementUpload)
-        .filter(StatementUpload.user_id == current_user.id)
-        .order_by(StatementUpload.upload_date.desc())
-        .all()
+def _process_statement_background(
+    statement_id: int, save_path: str, bank_source: str, user_id: int
+) -> None:
+    """Parse the PDF and insert transactions. Runs in a background thread after the
+    HTTP response is already sent, so the 30-second Render proxy timeout never fires."""
+    from app.services.pdf_parser import (
+        compute_transaction_hash,
+        parse_date,
+        parse_statement,
     )
-    skipped_map = {
-        s.id: json.loads(s.skipped_json)
-        for s in statements
-        if s.skipped_json
-    }
 
-    # Aggregate debit/credit totals per statement in one query
-    rows = (
-        db.query(
-            Transaction.statement_id,
-            Transaction.type,
-            func.sum(Transaction.amount).label("total"),
-        )
-        .filter(Transaction.statement_id.in_([s.id for s in statements]))
-        .group_by(Transaction.statement_id, Transaction.type)
-        .all()
-    )
-    totals_map: dict[int, dict] = {}
-    for row in rows:
-        totals_map.setdefault(row.statement_id, {})
-        totals_map[row.statement_id][row.type] = row.total
-
-    return templates.TemplateResponse(request, "upload.html", {
-        "banks": SUPPORTED_BANKS,
-        "statements": statements,
-        "skipped_map": skipped_map,
-        "totals_map": totals_map,
-        "current_user": current_user,
-    })
-
-
-@router.post("/upload")
-@limiter.limit("10/hour")
-async def upload_statement(
-    request: Request,
-    file: UploadFile = File(...),
-    bank_source: str = Form(...),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    # ── A1: Validate file extension ───────────────────────────────────────
-    if not file.filename.lower().endswith(".pdf"):
-        return _error_page(request, db, "Only PDF files are supported.")
-
-    # ── A1: Validate PDF magic bytes (%PDF) ──────────────────────────────
-    header = await file.read(4)
-    await file.seek(0)
-    if header != b"%PDF":
-        return _error_page(request, db, "Only PDF files are supported.")
-
-    # ── A1: Enforce 10 MB size limit ─────────────────────────────────────
-    content = await file.read()
-    await file.seek(0)
-    if len(content) > MAX_UPLOAD_BYTES:
-        return _error_page(request, db, "File too large. Maximum upload size is 10 MB.")
-
-    # Save PDF to uploads/
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    safe_name = f"{timestamp}_{file.filename}"
-    save_path = UPLOAD_DIR / safe_name
-    with open(save_path, "wb") as f:
-        f.write(content)
-
-    # Create statement record (status=processing)
-    statement = StatementUpload(
-        user_id=current_user.id,
-        filename=file.filename,
-        bank_source=bank_source,
-        status="processing",
-    )
-    db.add(statement)
-    db.commit()
-    db.refresh(statement)
-
+    db = SessionLocal()
+    statement = None
     try:
-        # Step 1: Parse transactions (+ closing balance) via GPT-4o Vision
-        parsed = parse_statement(str(save_path), bank_source)
-        statement.closing_balance = parsed.get("closing_balance")
-        statement.account_type    = parsed.get("account_type")
+        statement = db.query(StatementUpload).filter_by(id=statement_id).first()
+        if not statement:
+            return
 
-        # Step 3: Insert transactions (skip duplicates by hash, scoped to user)
-        user_id = current_user.id
+        parsed = parse_statement(save_path, bank_source)
+        statement.closing_balance = parsed.get("closing_balance")
+        statement.account_type = parsed.get("account_type")
+
         inserted = 0
         skipped = 0
         skipped_txs: list[dict] = []
         seen_hashes: set[str] = set()
+
         for t in parsed["transactions"]:
             try:
                 tx_date = parse_date(str(t["date"]))
             except ValueError:
-                continue  # Skip unparseable dates
-
+                continue
             amount = float(t.get("amount", 0))
             if amount <= 0:
-                continue  # Skip zero/negative amounts
+                continue
 
             tx_hash = compute_transaction_hash(
                 str(tx_date), t["description"], amount, bank_source,
@@ -202,7 +124,7 @@ async def upload_statement(
 
             tx = Transaction(
                 user_id=user_id,
-                statement_id=statement.id,
+                statement_id=statement_id,
                 date=tx_date,
                 transaction_date=tx_actual_date,
                 description=str(t["description"]).strip(),
@@ -220,33 +142,153 @@ async def upload_statement(
         statement.skipped_json = json.dumps(skipped_txs) if skipped_txs else None
         db.commit()
 
-        # ── H: Delete PDF after successful parse ──────────────────────────
         try:
-            save_path.unlink(missing_ok=True)
+            Path(save_path).unlink(missing_ok=True)
         except OSError:
             pass
 
-        # Step 4: Auto-categorize new transactions with AI
-        cat_failed = False
         if inserted > 0:
             from app.services.categorizer import batch_categorize_transactions
-            cat_failed = not batch_categorize_transactions(statement.id, db)
+            batch_categorize_transactions(statement_id, db)
 
-        redirect_url = f"/review?new=1&inserted={inserted}&skipped={skipped}"
-        if cat_failed:
-            redirect_url += f"&cat_failed=1&statement_id={statement.id}"
-        return RedirectResponse(url=redirect_url, status_code=303)
+    except Exception:
+        if statement is not None:
+            try:
+                statement.status = "failed"
+                db.commit()
+            except Exception:
+                pass
+        try:
+            Path(save_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+    finally:
+        db.close()
 
-    except Exception as e:
-        statement.status = "failed"
-        db.commit()
-        # ── A2: Sanitize error messages in production ─────────────────────
-        if os.getenv("ENVIRONMENT", "development") == "production":
-            error_msg = "An error occurred while processing the file. Please try again."
-        else:
-            error_msg = str(e)
-        return _error_page(request, db, error_msg, status_code=500, current_user=current_user)
 
+@router.get("/upload")
+def upload_page(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    statements = (
+        db.query(StatementUpload)
+        .filter(StatementUpload.user_id == current_user.id)
+        .order_by(StatementUpload.upload_date.desc())
+        .all()
+    )
+    skipped_map = {
+        s.id: json.loads(s.skipped_json)
+        for s in statements
+        if s.skipped_json
+    }
+
+    rows = (
+        db.query(
+            Transaction.statement_id,
+            Transaction.type,
+            func.sum(Transaction.amount).label("total"),
+        )
+        .filter(Transaction.statement_id.in_([s.id for s in statements]))
+        .group_by(Transaction.statement_id, Transaction.type)
+        .all()
+    )
+    totals_map: dict[int, dict] = {}
+    for row in rows:
+        totals_map.setdefault(row.statement_id, {})
+        totals_map[row.statement_id][row.type] = row.total
+
+    return templates.TemplateResponse(request, "upload.html", {
+        "banks": SUPPORTED_BANKS,
+        "statements": statements,
+        "skipped_map": skipped_map,
+        "totals_map": totals_map,
+        "current_user": current_user,
+    })
+
+
+@router.get("/upload/status/{statement_id}")
+def get_statement_status(
+    statement_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    statement = db.query(StatementUpload).filter(
+        StatementUpload.id == statement_id,
+        StatementUpload.user_id == current_user.id,
+    ).first()
+    if not statement:
+        return JSONResponse({"status": "not_found"}, status_code=404)
+
+    inserted = db.query(func.count(Transaction.id)).filter(
+        Transaction.statement_id == statement_id,
+        Transaction.user_id == current_user.id,
+    ).scalar() or 0
+    skipped = len(json.loads(statement.skipped_json or "[]"))
+
+    return JSONResponse({
+        "status": statement.status,
+        "inserted": inserted,
+        "skipped": skipped,
+    })
+
+
+@router.post("/upload")
+@limiter.limit("10/hour")
+async def upload_statement(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    bank_source: str = Form(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # ── Validate file extension ───────────────────────────────────────────────
+    if not file.filename.lower().endswith(".pdf"):
+        return _error_page(request, db, "Only PDF files are supported.", current_user=current_user)
+
+    # ── Validate PDF magic bytes (%PDF) ──────────────────────────────────────
+    header = await file.read(4)
+    await file.seek(0)
+    if header != b"%PDF":
+        return _error_page(request, db, "Only PDF files are supported.", current_user=current_user)
+
+    # ── Enforce 10 MB size limit ──────────────────────────────────────────────
+    content = await file.read()
+    await file.seek(0)
+    if len(content) > MAX_UPLOAD_BYTES:
+        return _error_page(request, db, "File too large. Maximum upload size is 10 MB.", current_user=current_user)
+
+    # Save PDF to uploads/
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    safe_name = f"{timestamp}_{file.filename}"
+    save_path = UPLOAD_DIR / safe_name
+    with open(save_path, "wb") as f:
+        f.write(content)
+
+    # Create statement record (status=processing)
+    statement = StatementUpload(
+        user_id=current_user.id,
+        filename=file.filename,
+        bank_source=bank_source,
+        status="processing",
+    )
+    db.add(statement)
+    db.commit()
+    db.refresh(statement)
+
+    # Schedule heavy work in a background thread — response returns immediately so
+    # Render's 30-second proxy timeout never fires.
+    background_tasks.add_task(
+        _process_statement_background,
+        statement_id=statement.id,
+        save_path=str(save_path),
+        bank_source=bank_source,
+        user_id=current_user.id,
+    )
+
+    return RedirectResponse(url=f"/upload?processing={statement.id}", status_code=303)
 
 
 @router.post("/statements/{statement_id}/recategorize")
@@ -285,7 +327,6 @@ def delete_statement(
         db.query(Transaction).filter(Transaction.statement_id == statement_id).delete()
         db.delete(statement)
         db.commit()
-        # PDFs are deleted right after parse; this handles any orphans from old uploads
         for f in UPLOAD_DIR.glob(f"*_{statement.filename}"):
             try:
                 f.unlink()

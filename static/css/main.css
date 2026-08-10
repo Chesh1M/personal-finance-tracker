@@ -547,6 +547,27 @@ input[type="month"].form-input::-webkit-calendar-picker-indicator {
   border-color: rgba(16, 185, 129, 0.3);
   color: #6ee7b7;
 }
+.alert-info {
+  background: rgba(12, 92, 171, 0.15);
+  border-color: rgba(12, 92, 171, 0.4);
+  color: #93c5fd;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+/* ── Inline spinner (used in processing badge and alert) ── */
+.spinner-inline {
+  display: inline-block;
+  width: 0.85rem;
+  height: 0.85rem;
+  border: 2px solid rgba(255,255,255,0.25);
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
 
 /* ── Review toolbar ── */
 .review-toolbar {
