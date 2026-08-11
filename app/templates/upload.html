@@ -101,7 +101,7 @@
           <td style="color: var(--text-muted);">
             {{ s.transactions | length }}
             {% if skipped_txs %}
-            <button class="btn btn-ghost" style="font-size:0.7rem; padding:0.15rem 0.5rem; margin-left:0.4rem; color:var(--warning);"
+            <button id="skipped-btn-{{ s.id }}" class="btn btn-ghost" style="font-size:0.7rem; padding:0.15rem 0.5rem; margin-left:0.4rem; color:var(--warning);"
                     onclick="this.closest('tr').nextElementSibling.classList.toggle('hidden')">
               {{ skipped_txs | length }} skipped
             </button>
@@ -157,10 +157,10 @@
           </td>
         </tr>
         {% if skipped_txs %}
-        <tr class="hidden" style="background: var(--surface);">
-          <td colspan="7" style="padding: 0.75rem 1rem;">
+        <tr id="skipped-rows-{{ s.id }}" class="hidden" style="background: var(--surface);">
+          <td colspan="8" style="padding: 0.75rem 1rem;">
             <p style="font-size:0.78rem; color:var(--warning); margin-bottom:0.5rem; font-weight:500;">
-              {{ skipped_txs | length }} duplicate(s) skipped — these transactions already exist in the database:
+              <span id="skipped-label-{{ s.id }}">{{ skipped_txs | length }} duplicate(s) skipped</span> — these transactions already exist in the database. If a row was skipped by mistake, click <strong>Add anyway</strong>.
             </p>
             <table style="width:100%; font-size:0.78rem; border-collapse:collapse;">
               <thead>
@@ -168,7 +168,8 @@
                   <th style="padding:0.25rem 0.75rem 0.25rem 0;">Date</th>
                   <th style="padding:0.25rem 0.75rem;">Description</th>
                   <th style="padding:0.25rem 0.75rem;">Amount</th>
-                  <th style="padding:0.25rem 0;">Type</th>
+                  <th style="padding:0.25rem 0.75rem;">Type</th>
+                  <th style="padding:0.25rem 0;"></th>
                 </tr>
               </thead>
               <tbody>
@@ -177,7 +178,15 @@
                   <td style="padding:0.3rem 0.75rem 0.3rem 0; font-family:'IBM Plex Mono',monospace; white-space:nowrap;">{{ tx.date }}</td>
                   <td style="padding:0.3rem 0.75rem; color:var(--text-muted);">{{ tx.description }}</td>
                   <td style="padding:0.3rem 0.75rem; font-family:'IBM Plex Mono',monospace;">${{ "%.2f"|format(tx.amount) }}</td>
-                  <td style="padding:0.3rem 0;"><span class="badge badge-{{ 'debit' if tx.type == 'debit' else 'credit' }}">{{ tx.type }}</span></td>
+                  <td style="padding:0.3rem 0.75rem;"><span class="badge badge-{{ 'debit' if tx.type == 'debit' else 'credit' }}">{{ tx.type }}</span></td>
+                  <td style="padding:0.3rem 0;">
+                    {% if tx.get('hash') %}
+                    <button class="btn btn-ghost" style="font-size:0.7rem; padding:0.15rem 0.55rem; color:var(--primary); white-space:nowrap;"
+                            onclick="restoreSkipped({{ s.id }}, {{ tx['hash'] | tojson }}, this)">
+                      Add anyway
+                    </button>
+                    {% endif %}
+                  </td>
                 </tr>
                 {% endfor %}
               </tbody>
@@ -233,6 +242,38 @@
     progress.classList.add('active');
     status.textContent = 'Uploading PDF…';
   });
+
+  // ── Restore a false-positive skipped transaction ──────────────────────────
+  async function restoreSkipped(statementId, txHash, btn) {
+    btn.disabled = true;
+    btn.textContent = 'Adding…';
+    try {
+      const fd = new FormData();
+      fd.append('tx_hash', txHash);
+      const res = await fetch(`/statements/${statementId}/restore-skipped`, { method: 'POST', body: fd });
+      const data = await res.json();
+      if (data.ok) {
+        btn.closest('tr').remove();
+        const skipBtn = document.getElementById(`skipped-btn-${statementId}`);
+        const label   = document.getElementById(`skipped-label-${statementId}`);
+        const n = data.remaining;
+        if (n === 0) {
+          if (skipBtn) skipBtn.remove();
+          const expandedRow = document.getElementById(`skipped-rows-${statementId}`);
+          if (expandedRow) expandedRow.remove();
+        } else {
+          if (skipBtn) skipBtn.textContent = `${n} skipped`;
+          if (label)   label.textContent   = `${n} duplicate(s) skipped`;
+        }
+      } else {
+        btn.textContent = 'Error';
+        btn.disabled = false;
+      }
+    } catch (_) {
+      btn.textContent = 'Add anyway';
+      btn.disabled = false;
+    }
+  }
 
   // ── Background processing poll ─────────────────────────────────────────────
   // Collect IDs to poll: either the ?processing=<id> query param (fresh upload)

@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import secrets
 import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -148,6 +149,9 @@ def _process_statement_background(
                     "description": str(t["description"]).strip(),
                     "amount": amount,
                     "type": str(t.get("type", "debit")).lower(),
+                    "is_transfer": bool(t.get("is_transfer", False)),
+                    "account_type": str(t.get("account_type", "other")) if t.get("account_type") else None,
+                    "hash": tx_hash,
                 })
                 continue
             seen_hashes.add(tx_hash)
@@ -354,6 +358,54 @@ async def upload_statement(
     )
 
     return RedirectResponse(url=f"/upload?processing={statement.id}", status_code=303)
+
+
+@router.post("/statements/{statement_id}/restore-skipped")
+def restore_skipped_transaction(
+    statement_id: int,
+    tx_hash: str = Form(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Force-insert a previously skipped (false-positive dedup) transaction."""
+    from app.services.pdf_parser import parse_date
+
+    statement = db.query(StatementUpload).filter(
+        StatementUpload.id == statement_id,
+        StatementUpload.user_id == current_user.id,
+    ).first()
+    if not statement or not statement.skipped_json:
+        return JSONResponse({"ok": False, "error": "Not found"}, status_code=404)
+
+    skipped = json.loads(statement.skipped_json)
+    entry = next((t for t in skipped if t.get("hash") == tx_hash), None)
+    if entry is None:
+        return JSONResponse({"ok": False, "error": "Transaction not found in skipped list"}, status_code=404)
+
+    try:
+        tx_date = parse_date(entry["date"])
+    except ValueError:
+        return JSONResponse({"ok": False, "error": "Invalid date"}, status_code=400)
+
+    tx = Transaction(
+        user_id=current_user.id,
+        statement_id=statement_id,
+        date=tx_date,
+        description=entry["description"],
+        amount=float(entry["amount"]),
+        type=entry.get("type", "debit"),
+        is_transfer=entry.get("is_transfer", False),
+        account_type=entry.get("account_type"),
+        is_reviewed=False,
+        hash=secrets.token_hex(32),  # unique hash; bypasses dedup intentionally
+    )
+    db.add(tx)
+
+    skipped = [t for t in skipped if t.get("hash") != tx_hash]
+    statement.skipped_json = json.dumps(skipped) if skipped else None
+    db.commit()
+
+    return JSONResponse({"ok": True, "remaining": len(skipped)})
 
 
 @router.post("/statements/{statement_id}/recategorize")
