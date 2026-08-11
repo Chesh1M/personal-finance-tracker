@@ -77,7 +77,7 @@ def batch_categorize_transactions(statement_id: int, db: Session) -> bool:
     )
 
     try:
-        client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"), timeout=60.0)
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[

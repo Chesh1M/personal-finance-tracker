@@ -16,6 +16,17 @@ _NON_TXN_DESCS = (
     "total debits", "total credits",
 )
 
+# DBS/POSB page-footer pattern that appears at the bottom of every page:
+# "Transaction Details as of DD Mon YYYY Page N of M  PDS_MMCON_..."
+# These lines must never be absorbed into a transaction description.
+_FOOTER_RE = _re.compile(
+    r"Transaction Details as of"
+    r"|PDS_MMCON"
+    r"|\bPage \d+ of \d+\b"
+    r"|\b\d{1,2} of \d{1,3}\b",  # catches "9 of 11" when "Page" lands in a separate column
+    _re.IGNORECASE,
+)
+
 _DATE_RE = _re.compile(
     r"\b\d{2}[/\-]\d{2}[/\-]\d{2,4}\b"  # 31/05/2026 or 31-05-26
     r"|\b\d{2}\s+\w{3}\s+\d{4}\b"        # 31 May 2026
@@ -67,7 +78,7 @@ from openai import OpenAI
 
 # 90-second timeout per call. OpenAI default is 600s — a hung Vision request
 # would otherwise block the background thread for up to 10 minutes silently.
-client = OpenAI(timeout=90.0)
+client = OpenAI(timeout=180.0)  # Vision (Stage 1) takes 60-120s for multi-page PDFs; 90s was too tight
 
 # ── Stage 1: Vision layout-detection schema ───────────────────────────────────
 _LAYOUT_SYSTEM_PROMPT = """You are a bank statement layout analyser.
@@ -381,26 +392,50 @@ def _match_header_line(header_text: str, text_lines: list[dict]) -> dict | None:
     if not candidates:
         return None
 
-    # Sort by y-center ascending (prefer topmost match), then by match quality.
-    candidates.sort(key=lambda c: ((c[1]["y0"] + c[1]["y1"]) / 2, c[0]))
+    # Sort by match quality first (0=exact, 1=first-word, 2=substring), then by
+    # y-center ascending within the same quality tier. This ensures an exact-match
+    # column header is always preferred over a higher-on-page substring hit such as
+    # "Total Deposits" matching a "Deposit (+)" lookup.
+    candidates.sort(key=lambda c: (c[0], (c[1]["y0"] + c[1]["y1"]) / 2))
     return candidates[0][1]
 
 
 def _find_column_boundaries(
-    columns: list[dict], text_lines: list[dict], page_width: float
+    columns: list[dict], text_lines: list[dict], page_width: float,
+    table_y_start: float | None = None,
+    table_x_start: float | None = None,
 ) -> list[dict]:
     """Derive x-boundaries for each semantic column from matched header positions.
+
+    table_y_start: Vision's table bbox y0 in PDF points — restricts header search to
+        a narrow band near the actual column header row, preventing headers from a
+        second account section on the same page (or account-summary lines) from being
+        picked up instead of the intended column header row.
+    table_x_start: Vision's table bbox x0 in PDF points — becomes the left boundary
+        of the leftmost column, dropping words in the page's left margin (e.g. rotated
+        DBS registration stamps) that would otherwise land in the date column.
 
     Returns list of dicts sorted left-to-right:
       {"field": str, "header_text": str, "x_start": float, "x_end": float,
        "header_y_bottom": float}
     Only includes columns whose header was found in the native text.
     """
+    # Narrow the search to text lines near the expected header row, if we know where it is.
+    # A ±5 pt lower margin and +50 pt upper margin handles minor Vision imprecision and
+    # multi-row column headers while excluding content from other table sections.
+    if table_y_start is not None:
+        search_lines = [
+            l for l in text_lines
+            if l["y0"] >= table_y_start - 5 and l["y0"] <= table_y_start + 50
+        ]
+    else:
+        search_lines = text_lines
+
     located = []
     for col in columns:
         if col["field"] == "other":
             continue
-        match = _match_header_line(col["header_text"], text_lines)
+        match = _match_header_line(col["header_text"], search_lines)
         if match:
             x_center = (match["x0"] + match["x1"]) / 2
             located.append({
@@ -415,8 +450,11 @@ def _find_column_boundaries(
 
     located.sort(key=lambda c: c["x_center"])
 
-    # Midpoint boundaries
-    boundaries = [0.0]
+    # Midpoint boundaries. The leftmost boundary is set to table_x_start (if provided)
+    # so that words in the page's left margin — outside the table's physical left edge —
+    # fall outside all column ranges and are silently ignored.
+    left_boundary = table_x_start if table_x_start is not None else 0.0
+    boundaries = [left_boundary]
     for i in range(len(located) - 1):
         boundaries.append((located[i]["x_center"] + located[i + 1]["x_center"]) / 2)
     boundaries.append(page_width)
@@ -541,10 +579,18 @@ def _extract_rows_from_page(
         elif rows:
             # Continuation line: fold all non-empty cell text (in column order)
             # into the preceding anchor's description.
+            # Money columns (debit/credit/balance) only contribute if their value
+            # looks like an actual monetary amount — non-money text landing there
+            # (e.g. "Page" from a footer that collides with the balance column) is
+            # noise and must not bleed into the description.
             continuation = " ".join(
-                row_dict[c["field"]] for c in col_defs if row_dict.get(c["field"])
+                row_dict[c["field"]] for c in col_defs
+                if row_dict.get(c["field"]) and (
+                    c["field"] not in {"debit", "credit", "balance"}
+                    or _is_money_value(row_dict[c["field"]])
+                )
             )
-            if continuation:
+            if continuation and not _FOOTER_RE.search(continuation):
                 rows[-1]["description"] = (
                     rows[-1].get("description", "") + " " + continuation
                 ).strip()
@@ -652,14 +698,24 @@ def parse_statement(pdf_path: str, bank_source: str) -> dict:
         text_lines = all_text_lines[page_num - 1]
         page_width = page.rect.width
 
-        # Stage 2: derive boundaries and extract rows
-        col_defs = _find_column_boundaries(columns, text_lines, page_width)
+        # Stage 2: derive boundaries and extract rows.
+        # Vision returns table_bbox in native PDF-point coordinates (same system as
+        # the text_lines from PyMuPDF). The y0/x0 values are passed unscaled so
+        # _find_column_boundaries can restrict its header search to the correct
+        # table section and set the correct left-margin boundary.
+        # The y1 (table bottom) is scaled by 72/150 to convert from the pixel-space
+        # Vision was trained on — this gives a tighter cutoff that reliably excludes
+        # footers and secondary account sections that appear below the transactions.
+        _PDF_SCALE = 72.0 / 150.0
+        bbox = page_info.get("table_bbox")
+        col_defs = _find_column_boundaries(
+            columns, text_lines, page_width,
+            table_y_start=bbox[1] if bbox else None,
+            table_x_start=bbox[0] if bbox else None,
+        )
         if not col_defs:
             continue
 
-        # Convert table_bbox bottom from image pixels (150 DPI) → PDF points
-        _PDF_SCALE = 72.0 / 150.0
-        bbox = page_info.get("table_bbox")
         table_y_end = bbox[3] * _PDF_SCALE if bbox else None
 
         rows = _extract_rows_from_page(page, col_defs, table_y_end=table_y_end)

@@ -61,11 +61,42 @@ def _error_page(request: Request, db: Session, error: str, status_code: int = 40
     )
 
 
+def _mark_failed(statement_id: int, statement, db) -> None:
+    """Mark a statement as failed.
+
+    Tries the existing session first; if that session is in a broken state
+    (e.g. mid-exception rollback), opens a fresh connection as fallback so
+    the status update always lands even if the primary session is unusable.
+    """
+    if statement is not None:
+        try:
+            statement.status = "failed"
+            db.commit()
+            return
+        except Exception:
+            pass
+    try:
+        fresh = SessionLocal()
+        s = fresh.query(StatementUpload).filter_by(id=statement_id).first()
+        if s:
+            s.status = "failed"
+            fresh.commit()
+        fresh.close()
+    except Exception:
+        logger.error("Could not mark statement %d as failed via any session", statement_id)
+
+
 def _process_statement_background(
     statement_id: int, save_path: str, bank_source: str, user_id: int
 ) -> None:
     """Parse the PDF and insert transactions. Runs in a background thread after the
-    HTTP response is already sent, so the 30-second Render proxy timeout never fires."""
+    HTTP response is already sent, so the 30-second Render proxy timeout never fires.
+
+    Structured in two independent phases:
+    - Phase A: parse + insert + commit("completed"). On failure: mark "failed" and return.
+    - Phase B: categorize. Runs only after Phase A succeeds. Failure here is non-fatal
+      and never touches statement.status — transactions are already committed.
+    """
     from app.services.pdf_parser import (
         compute_transaction_hash,
         parse_date,
@@ -74,17 +105,19 @@ def _process_statement_background(
 
     db = SessionLocal()
     statement = None
+    inserted = 0  # must be declared before Phase A so Phase B can read it
+
+    # ── Phase A: parse PDF + insert transactions ──────────────────────────────
     try:
         statement = db.query(StatementUpload).filter_by(id=statement_id).first()
         if not statement:
+            db.close()
             return
 
         parsed = parse_statement(save_path, bank_source)
         statement.closing_balance = parsed.get("closing_balance")
         statement.account_type = parsed.get("account_type")
 
-        inserted = 0
-        skipped = 0
         skipped_txs: list[dict] = []
         seen_hashes: set[str] = set()
 
@@ -116,7 +149,6 @@ def _process_statement_background(
                     "amount": amount,
                     "type": str(t.get("type", "debit")).lower(),
                 })
-                skipped += 1
                 continue
             seen_hashes.add(tx_hash)
 
@@ -146,31 +178,37 @@ def _process_statement_background(
 
         statement.status = "completed"
         statement.skipped_json = json.dumps(skipped_txs) if skipped_txs else None
-        db.commit()
-
-        try:
-            Path(save_path).unlink(missing_ok=True)
-        except OSError:
-            pass
-
-        if inserted > 0:
-            from app.services.categorizer import batch_categorize_transactions
-            batch_categorize_transactions(statement_id, db)
+        db.commit()  # "completed" is permanent after this line
 
     except Exception:
-        logger.error("Background parse failed for statement %d:\n%s", statement_id, traceback.format_exc())
-        if statement is not None:
-            try:
-                statement.status = "failed"
-                db.commit()
-            except Exception:
-                logger.error("Could not mark statement %d as failed", statement_id, exc_info=True)
+        logger.error("Background parse failed for statement %d:\n%s",
+                     statement_id, traceback.format_exc())
+        _mark_failed(statement_id, statement, db)
         try:
             Path(save_path).unlink(missing_ok=True)
         except OSError:
             pass
-    finally:
         db.close()
+        return  # Phase B must NOT run if Phase A failed
+
+    # Clean up PDF on success path
+    try:
+        Path(save_path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+    # ── Phase B: categorize (independent — never touches statement.status) ────
+    if inserted > 0:
+        try:
+            from app.services.categorizer import batch_categorize_transactions
+            batch_categorize_transactions(statement_id, db)
+        except Exception:
+            logger.error(
+                "Categorizer failed for statement %d (transactions are committed OK):\n%s",
+                statement_id, traceback.format_exc(),
+            )
+
+    db.close()
 
 
 @router.get("/upload")
