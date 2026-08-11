@@ -1,10 +1,16 @@
 import json
+import logging
 import os
+import traceback
 
 from openai import OpenAI
 from sqlalchemy.orm import Session
 
 from app.models import CategorizationExample, Category, Transaction
+
+logger = logging.getLogger(__name__)
+
+_BATCH_SIZE = 30  # transactions per GPT call — keeps output size predictable
 
 
 def batch_categorize_transactions(statement_id: int, db: Session) -> bool:
@@ -42,10 +48,6 @@ def batch_categorize_transactions(statement_id: int, db: Session) -> bool:
         for c in categories
         if not c.is_transfer
     ]
-    tx_list = [
-        {"i": i, "desc": tx.description, "amount": float(tx.amount), "type": tx.type}
-        for i, tx in enumerate(to_categorize)
-    ]
 
     # Inject past user corrections as few-shot examples (most recent 30, unique per description)
     examples = (
@@ -67,36 +69,50 @@ def batch_categorize_transactions(statement_id: int, db: Session) -> bool:
         if example_lines else ""
     )
 
-    prompt = (
-        f"{examples_section}"
-        f"Categorize each transaction using one of these categories:\n"
-        f"{json.dumps(spending_cats)}\n\n"
-        f"Transactions:\n{json.dumps(tx_list)}\n\n"
-        f'Return JSON: {{"assignments": [{{"i": <index>, "category": <name>}}]}}\n'
-        f'Use "others" when unsure. Singapore spending context.'
-    )
+    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"), timeout=120.0)
+    all_ok = True
 
-    try:
-        client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"), timeout=60.0)
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a personal finance transaction categorizer for a user in Singapore.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0,
+    # Process in chunks so GPT output stays predictable regardless of statement size
+    for chunk_start in range(0, len(to_categorize), _BATCH_SIZE):
+        chunk = to_categorize[chunk_start : chunk_start + _BATCH_SIZE]
+        tx_list = [
+            {"i": i, "desc": tx.description, "amount": float(tx.amount), "type": tx.type}
+            for i, tx in enumerate(chunk)
+        ]
+        prompt = (
+            f"{examples_section}"
+            f"Categorize each transaction using one of these categories:\n"
+            f"{json.dumps(spending_cats)}\n\n"
+            f"Transactions:\n{json.dumps(tx_list)}\n\n"
+            f'Return JSON: {{"assignments": [{{"i": <index>, "category": <name>}}]}}\n'
+            f'Use "others" when unsure. Singapore spending context.'
         )
-        result = json.loads(resp.choices[0].message.content)
-        for assignment in result.get("assignments", []):
-            idx = assignment.get("i")
-            cat_name = assignment.get("category")
-            if idx is not None and 0 <= idx < len(to_categorize) and cat_name in cat_by_name:
-                to_categorize[idx].category_id = cat_by_name[cat_name].id
-        db.commit()
-        return True
-    except Exception:
-        return False
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a personal finance transaction categorizer for a user in Singapore.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0,
+            )
+            result = json.loads(resp.choices[0].message.content)
+            for assignment in result.get("assignments", []):
+                idx = assignment.get("i")
+                cat_name = assignment.get("category")
+                if idx is not None and 0 <= idx < len(chunk) and cat_name in cat_by_name:
+                    chunk[idx].category_id = cat_by_name[cat_name].id
+            db.commit()
+        except Exception:
+            logger.error(
+                "Categorizer GPT call failed for statement %d (chunk %d-%d):\n%s",
+                statement_id, chunk_start, chunk_start + len(chunk) - 1,
+                traceback.format_exc(),
+            )
+            all_ok = False
+
+    return all_ok

@@ -170,8 +170,11 @@ Rules:
 - date: YYYY-MM-DD
 - transaction_date: YYYY-MM-DD or null
 - is_transfer: true for wallet top-ups, own-account transfers, credit card bill payments
-- reference_id: if a standalone numeric reference (8+ digits, not a card or account number)
-  appears in the description, extract it here; null if none
+- reference_id: extract the LAST standalone numeric token (8+ digits) that is NOT formatted as a
+  hyphenated card number (e.g. "4628-4500-4754-4953"). For DBS "Debit Card Transaction" rows
+  this is the authorization/trace code on the final continuation line (e.g. "000002438222766").
+  This is the only field that distinguishes two same-merchant same-amount same-day transactions —
+  always extract it when present. Return null only when no such token exists.
 - account_type: infer from context — one of "savings", "current", "credit_card", "paylah", "other"
 - closing_balance: the last balance value in the balance column, or null if not available
 - description: merchant or narrative text only. Preserve the type prefix (e.g. "Debit Card
