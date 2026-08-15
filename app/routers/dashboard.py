@@ -1,16 +1,21 @@
 import json
-from datetime import date
+import logging
+import os
+from datetime import date, datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Body, Depends, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from openai import OpenAI
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.dependencies import get_current_user
-from app.models import Category, User
+from app.models import AiMonthlyInsight, Category, Transaction, User
 from app.services import analytics
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["dashboard"])
 
@@ -24,6 +29,172 @@ def _pct_change(curr: float, prev: float) -> float | None:
     if not prev:
         return None
     return (curr - prev) / abs(prev) * 100
+
+
+@router.post("/api/ask")
+async def api_ask(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """AI data assistant — answer a free-text question about the user's finances.
+
+    Request body: {"question": str, "selected_month": "YYYY-MM"}
+    Response: {"answer_type": "text"|"chart", "text": str, "chart": {...}|null}
+    """
+    body = await request.json()
+    question = str(body.get("question", "")).strip()
+    selected_month_str = str(body.get("selected_month", ""))
+
+    if not question:
+        return JSONResponse({"error": "question required"}, status_code=400)
+
+    user_id = current_user.id
+
+    # Resolve anchor month
+    try:
+        anchor = date.fromisoformat(selected_month_str + "-01")
+        anchor_year, anchor_month = anchor.year, anchor.month
+    except ValueError:
+        avail = analytics.get_available_months(db, user_id)
+        if avail:
+            anchor_year, anchor_month = avail[0]
+        else:
+            return JSONResponse({"answer_type": "text", "text": "No transaction data found.", "chart": None})
+
+    # Build 6-month context
+    from app.services.analytics import _prev_months, _month_start, _month_end, _month_label
+    months = _prev_months(anchor_year, anchor_month, 6)
+    start  = _month_start(months[0][0], months[0][1])
+    end    = _month_end(months[-1][0], months[-1][1])
+    context_label = f"{_month_label(*months[0])} – {_month_label(*months[-1])}"
+
+    tx_rows = (
+        db.query(Transaction)
+        .filter(
+            Transaction.is_reviewed == True,   # noqa: E712
+            Transaction.user_id == user_id,
+            Transaction.date >= start,
+            Transaction.date <= end,
+        )
+        .order_by(Transaction.date.desc())
+        .limit(500)
+        .all()
+    )
+
+    # Build category lookup
+    cats = {c.id: c.display_name for c in db.query(Category).all()}
+
+    tx_list = [
+        {
+            "date":        str(tx.date),
+            "description": tx.description,
+            "amount":      round(abs(tx.amount), 2),
+            "type":        tx.type,
+            "category":    cats.get(tx.category_id, "Uncategorized"),
+        }
+        for tx in tx_rows
+    ]
+
+    # Monthly summaries for context
+    monthly_summaries = []
+    for y, m in months:
+        s = analytics.get_summary_stats(db, y, m, user_id)
+        monthly_summaries.append({
+            "month":        _month_label(y, m),
+            "spending":     s["total_spending"],
+            "income":       s["total_income"],
+            "savings_rate": s["savings_rate"],
+        })
+
+    context_payload = {
+        "context_months":    context_label,
+        "monthly_summaries": monthly_summaries,
+        "transactions":      tx_list,
+    }
+
+    system_prompt = (
+        "You are a personal finance assistant for a user in Singapore. "
+        "Answer questions about their spending and income using ONLY the data provided. "
+        "Be concise and specific — cite amounts and merchants where relevant. "
+        "When the question asks for a breakdown, comparison, or trend that is best shown visually, "
+        "set answer_type to 'chart' and populate the chart field. Otherwise use 'text'. "
+        "Always respond with valid JSON matching this schema exactly:\n"
+        '{"answer_type": "text" | "chart", "text": "<answer>", '
+        '"chart": {"type": "bar"|"line"|"doughnut", "title": "...", '
+        '"labels": [...], "datasets": [{"label": "...", "data": [...]}]} | null}'
+    )
+    user_prompt = (
+        f"Context: {json.dumps(context_payload)}\n\n"
+        f"Question: {question}"
+    )
+
+    try:
+        client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"), timeout=45.0)
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0,
+            max_tokens=600,
+        )
+        result = json.loads(resp.choices[0].message.content)
+        return JSONResponse(result)
+    except Exception:
+        logger.error("api_ask GPT call failed for user %d", user_id)
+        return JSONResponse({
+            "answer_type": "text",
+            "text": "Sorry, I couldn't process your question right now. Please try again.",
+            "chart": None,
+        })
+
+
+@router.post("/api/refresh-insight")
+def api_refresh_insight(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Delete cached AI insight for a month and regenerate it.
+
+    Query param: ?month=YYYY-MM
+    Returns: {"ok": true, "insight": "..."}
+    """
+    month_str = request.query_params.get("month", "")
+    try:
+        parsed = date.fromisoformat(month_str + "-01")
+        year, month_int = parsed.year, parsed.month
+    except ValueError:
+        return JSONResponse({"ok": False, "error": "bad month"}, status_code=400)
+
+    user_id = current_user.id
+
+    # Delete cached row
+    existing = (
+        db.query(AiMonthlyInsight)
+        .filter_by(user_id=user_id, year=year, month=month_int)
+        .first()
+    )
+    if existing:
+        db.delete(existing)
+        db.commit()
+
+    # Regenerate
+    new_insight = analytics.generate_spending_insight(year, month_int, user_id, db)
+    try:
+        db.add(AiMonthlyInsight(
+            user_id=user_id, year=year, month=month_int,
+            insight_text=new_insight,
+            generated_at=datetime.now(timezone.utc),
+        ))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    return JSONResponse({"ok": True, "insight": new_insight})
 
 
 @router.get("/api/spending")
@@ -157,12 +328,36 @@ def dashboard(
     account_balances = analytics.get_account_balances(db, year, month_int, user_id)
     reimbursements   = analytics.get_reimbursements(db, year, month_int, user_id)
     insights         = analytics.get_insights(db, year, month_int, user_id)
+    income_sources   = analytics.get_income_by_source(db, year, month_int, user_id)
+    category_trend   = analytics.get_category_monthly_trend(db, year, month_int, user_id)
     spending_categories = (
         db.query(Category)
         .filter(Category.is_transfer == False, Category.name != "reimbursements")  # noqa: E712
         .order_by(Category.display_name)
         .all()
     )
+
+    # ── AI spending insight (cached per user/month) ────────────────────────
+    ai_insight: str | None = None
+    if year and month_int:
+        existing_insight = (
+            db.query(AiMonthlyInsight)
+            .filter_by(user_id=user_id, year=year, month=month_int)
+            .first()
+        )
+        if existing_insight:
+            ai_insight = existing_insight.insight_text
+        elif stats["tx_count"] > 0:
+            ai_insight = analytics.generate_spending_insight(year, month_int, user_id, db)
+            try:
+                db.add(AiMonthlyInsight(
+                    user_id=user_id, year=year, month=month_int,
+                    insight_text=ai_insight,
+                    generated_at=datetime.now(timezone.utc),
+                ))
+                db.commit()
+            except Exception:
+                db.rollback()  # unique constraint race — fine to skip
 
     # ── Gather comparison data ─────────────────────────────────────────────
     comparison_stats         = analytics.get_summary_stats(db, comp_year, comp_month_int, user_id)
@@ -226,6 +421,9 @@ def dashboard(
             "category_json":          json.dumps(category_data),
             "category_details_json":  json.dumps(category_details),
             "trend_json":             json.dumps(trend_data),
+            "income_sources_json":    json.dumps(income_sources),
+            "category_trend_json":    json.dumps(category_trend),
+            "ai_insight":             ai_insight,
             "account_balances":       account_balances,
             "reimbursements":         reimbursements,
             "spending_categories":    spending_categories,

@@ -115,3 +115,18 @@ class TradeLog(Base):
     date = Column(Date, nullable=False)
     currency = Column(String, default="USD", nullable=False)
     notes = Column(Text, nullable=True)
+
+
+class AiMonthlyInsight(Base):
+    __tablename__ = "ai_monthly_insights"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    year = Column(Integer, nullable=False)
+    month = Column(Integer, nullable=False)
+    insight_text = Column(Text, nullable=True)
+    generated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "year", "month", name="uq_ai_insight_user_year_month"),
+    )

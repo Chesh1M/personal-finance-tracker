@@ -6,12 +6,18 @@ No python-dateutil: month arithmetic uses the calendar stdlib.
 """
 
 import calendar
+import json
+import logging
+import os
 from datetime import date
 
+from openai import OpenAI
 from sqlalchemy import extract, func
 from sqlalchemy.orm import Session, aliased
 
 from app.models import Category, StatementUpload, Transaction
+
+logger = logging.getLogger(__name__)
 
 
 # ── Split-range helper ──────────────────────────────────────────────────────
@@ -712,3 +718,231 @@ def get_insights(db: Session, year: int | None, month: int | None, user_id: int)
         })
 
     return cards[:5]
+
+
+def get_income_by_source(
+    db: Session, year: int, month: int, user_id: int, n_months: int = 12
+) -> dict:
+    """Monthly income broken down by description for the last n_months ending at (year, month).
+
+    Returns:
+        {
+            "labels":  ["Aug 2025", ..., "Jul 2026"],
+            "sources": {
+                "FAST Payment / ACME CORP": [5000.0, 5000.0, ...],
+                "Interest Earned":          [3.5, 2.8, ...],
+                "Other":                    [0.0, 100.0, ...],
+            }
+        }
+    Descriptions truncated to 40 chars. If more than 5 unique descriptions exist across
+    all months, the smallest contributors are collapsed into "Other".
+    """
+    months = _prev_months(year, month, n_months)
+    start = _month_start(months[0][0], months[0][1])
+    end   = _month_end(months[-1][0], months[-1][1])
+
+    income_cat = db.query(Category).filter(Category.name == "income").first()
+    if not income_cat:
+        labels = [_month_label(y, m) for y, m in months]
+        return {"labels": labels, "sources": {}}
+
+    rows = (
+        db.query(
+            extract("year",  Transaction.date).label("yr"),
+            extract("month", Transaction.date).label("mo"),
+            Transaction.description.label("desc"),
+            func.sum(func.abs(Transaction.amount)).label("total"),
+        )
+        .filter(
+            Transaction.is_reviewed == True,   # noqa: E712
+            Transaction.is_transfer == False,  # noqa: E712
+            Transaction.user_id == user_id,
+            Transaction.type == "credit",
+            Transaction.category_id == income_cat.id,
+            Transaction.date >= start,
+            Transaction.date <= end,
+        )
+        .group_by(
+            extract("year",  Transaction.date),
+            extract("month", Transaction.date),
+            Transaction.description,
+        )
+        .all()
+    )
+
+    # Build per-description totals to identify top N sources
+    desc_totals: dict[str, float] = {}
+    for r in rows:
+        desc = (r.desc or "")[:40]
+        desc_totals[desc] = desc_totals.get(desc, 0.0) + (r.total or 0.0)
+
+    _MAX_SOURCES = 5
+    if len(desc_totals) > _MAX_SOURCES:
+        sorted_descs = sorted(desc_totals, key=lambda d: desc_totals[d], reverse=True)
+        top_descs = set(sorted_descs[:_MAX_SOURCES])
+    else:
+        top_descs = set(desc_totals.keys())
+
+    # Index data by (year, month, description)
+    data: dict[tuple, dict[str, float]] = {}
+    for r in rows:
+        key = (int(r.yr), int(r.mo))
+        desc = (r.desc or "")[:40]
+        label = desc if desc in top_descs else "Other"
+        data.setdefault(key, {})
+        data[key][label] = data[key].get(label, 0.0) + (r.total or 0.0)
+
+    # Collect all source names (top_descs + "Other" if needed)
+    all_sources: list[str] = sorted(
+        top_descs, key=lambda d: desc_totals.get(d, 0.0), reverse=True
+    )
+    has_other = any(
+        desc not in top_descs
+        for desc in desc_totals
+    )
+    if has_other:
+        all_sources.append("Other")
+
+    labels = [_month_label(y, m) for y, m in months]
+    sources: dict[str, list[float]] = {s: [] for s in all_sources}
+
+    for y, m in months:
+        month_data = data.get((y, m), {})
+        for s in all_sources:
+            sources[s].append(round(month_data.get(s, 0.0), 2))
+
+    return {"labels": labels, "sources": sources}
+
+
+def get_category_monthly_trend(
+    db: Session, year: int, month: int, user_id: int, n_months: int = 12
+) -> dict:
+    """Monthly spending per category for the last n_months ending at (year, month).
+
+    Single query (no Python loop) — efficient for large date ranges.
+
+    Returns:
+        {
+            "labels":     ["Aug 2025", ..., "Jul 2026"],
+            "categories": {
+                "Food & Dining": [150.0, 200.0, ...],
+                "Transport":     [80.0, 90.0, ...],
+            }
+        }
+    Only non-transfer debit transactions are included. Categories with zero spend
+    across all months are omitted.
+    """
+    months = _prev_months(year, month, n_months)
+    start = _month_start(months[0][0], months[0][1])
+    end   = _month_end(months[-1][0], months[-1][1])
+
+    rows = (
+        db.query(
+            extract("year",  Transaction.date).label("yr"),
+            extract("month", Transaction.date).label("mo"),
+            func.coalesce(Category.display_name, "Uncategorized").label("cat"),
+            func.sum(func.abs(Transaction.amount)).label("total"),
+        )
+        .outerjoin(Category, Transaction.category_id == Category.id)
+        .filter(
+            Transaction.is_reviewed == True,   # noqa: E712
+            Transaction.is_transfer == False,  # noqa: E712
+            Transaction.type == "debit",
+            Transaction.user_id == user_id,
+            Transaction.date >= start,
+            Transaction.date <= end,
+        )
+        .group_by(
+            extract("year",  Transaction.date),
+            extract("month", Transaction.date),
+            func.coalesce(Category.display_name, "Uncategorized"),
+        )
+        .all()
+    )
+
+    # Index by (year, month) → {cat: amount}
+    data: dict[tuple, dict[str, float]] = {}
+    all_cats: set[str] = set()
+    for r in rows:
+        key = (int(r.yr), int(r.mo))
+        data.setdefault(key, {})
+        data[key][r.cat] = round((r.total or 0.0), 2)
+        all_cats.add(r.cat)
+
+    labels = [_month_label(y, m) for y, m in months]
+    categories: dict[str, list[float]] = {}
+
+    for cat in sorted(all_cats):
+        series = [data.get((y, m), {}).get(cat, 0.0) for y, m in months]
+        if any(v > 0 for v in series):
+            categories[cat] = series
+
+    return {"labels": labels, "categories": categories}
+
+
+def generate_spending_insight(year: int, month: int, user_id: int, db: Session) -> str | None:
+    """Call GPT-4o-mini to generate a 1–3 sentence spending insight for the given month.
+
+    Only considers reviewed debit transactions (non-transfer).
+    Returns the insight string, or None if GPT returns "null" or the call fails.
+    """
+    from datetime import timezone
+    start = _month_start(year, month)
+    end   = _month_end(year, month)
+    label = _month_label(year, month)
+
+    rows = (
+        db.query(
+            Transaction.description,
+            func.abs(Transaction.amount).label("amount"),
+            func.count(Transaction.id).label("cnt"),
+        )
+        .filter(
+            Transaction.is_reviewed == True,   # noqa: E712
+            Transaction.is_transfer == False,  # noqa: E712
+            Transaction.type == "debit",
+            Transaction.user_id == user_id,
+            Transaction.date >= start,
+            Transaction.date <= end,
+        )
+        .group_by(Transaction.description)
+        .order_by(func.abs(Transaction.amount).desc())
+        .limit(60)
+        .all()
+    )
+
+    if not rows:
+        return None
+
+    tx_summary = [
+        {"description": r.description, "total": round(float(r.amount), 2), "count": r.cnt}
+        for r in rows
+    ]
+
+    prompt = (
+        f"You are a personal finance advisor for a user in Singapore.\n"
+        f"Given their reviewed spending for {label}, identify 1–2 spending patterns they might "
+        f"not be aware of that could be worth reviewing — e.g. recurring subscriptions, frequent "
+        f"small indulgences that add up, a category with surprisingly high frequency.\n"
+        f"Be specific: name the merchant or pattern and give the total. "
+        f"Keep the whole response under 3 sentences. "
+        f"If there is nothing noteworthy, respond with exactly: null\n\n"
+        f"Spending data (grouped by description, sorted by total):\n"
+        f"{json.dumps(tx_summary)}"
+    )
+
+    try:
+        client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"), timeout=30.0)
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=200,
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        if text.lower() == "null" or not text:
+            return None
+        return text
+    except Exception:
+        logger.error("generate_spending_insight failed for user %d %d-%02d", user_id, year, month)
+        return None

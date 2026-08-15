@@ -3,6 +3,74 @@
 {% block main_class %}wide{% endblock %}
 
 {% block content %}
+<style>
+/* ── Feature 5: period label in stat cards ─────────────────────────── */
+.stat-period {
+  font-size: 0.65rem;
+  font-weight: 400;
+  opacity: 0.45;
+  margin-left: 0.3rem;
+  font-family: 'IBM Plex Sans', sans-serif;
+  vertical-align: baseline;
+}
+
+/* ── Feature 3: AI spending insight card ───────────────────────────── */
+.insight-ai { border-left-color: #8b5cf6; }
+.insight-ai .insight-icon { color: #8b5cf6; }
+.refresh-insight-btn {
+  background: none; border: none;
+  color: rgba(250,250,250,0.4); cursor: pointer;
+  font-size: 0.9rem; padding: 0.1rem 0.3rem;
+  border-radius: 3px; transition: color 0.15s;
+  flex-shrink: 0; align-self: flex-start;
+}
+.refresh-insight-btn:hover { color: #8b5cf6; }
+
+/* ── Feature 4: category trend controls ────────────────────────────── */
+.cat-trend-controls { display:flex; flex-wrap:wrap; gap:0.4rem 0.75rem; margin-bottom:0.75rem; font-size:0.8rem; }
+.cat-trend-controls label { display:flex; align-items:center; gap:0.3rem; color:rgba(250,250,250,0.6); cursor:pointer; }
+.cat-trend-controls label input[type=checkbox] { accent-color: currentColor; width:12px; height:12px; }
+.cat-trend-show-more { background:none; border:none; color:var(--primary); font-size:0.75rem; cursor:pointer; padding:0; }
+.cat-trend-hidden { display:none; }
+
+/* ── Feature 2: AI assistant FAB + overlay ─────────────────────────── */
+.ai-fab {
+  position:fixed; bottom:1.5rem; right:1.5rem; z-index:1000;
+  width:52px; height:52px; border-radius:50%;
+  background:var(--primary); border:none; color:#fff; font-size:1.3rem;
+  cursor:pointer; display:flex; align-items:center; justify-content:center;
+  box-shadow:0 4px 20px rgba(12,92,171,0.45);
+  transition:transform 0.15s, box-shadow 0.15s;
+}
+.ai-fab:hover { transform:scale(1.05); box-shadow:0 6px 24px rgba(12,92,171,0.6); }
+.ai-overlay {
+  position:fixed; inset:2rem; z-index:1001;
+  background:#111113; border:1px solid rgba(255,255,255,0.1);
+  border-radius:12px; display:flex; flex-direction:column;
+  box-shadow:0 20px 60px rgba(0,0,0,0.6); overflow:hidden;
+}
+.ai-overlay-header {
+  display:flex; align-items:center;
+  padding:0.9rem 1.25rem;
+  border-bottom:1px solid rgba(255,255,255,0.08);
+  gap:0.75rem; flex-shrink:0;
+}
+.ai-overlay-title { flex:1; font-weight:600; font-size:0.95rem; display:flex; align-items:center; gap:0.5rem; }
+.ai-context-label { font-size:0.72rem; opacity:0.45; font-weight:400; }
+.ai-overlay-close { background:none; border:none; color:rgba(250,250,250,0.5); font-size:1.2rem; cursor:pointer; padding:0.2rem 0.4rem; border-radius:4px; }
+.ai-overlay-close:hover { color:#fafafa; }
+.ai-thread { flex:1; overflow-y:auto; padding:1rem 1.25rem; display:flex; flex-direction:column; gap:1rem; }
+.ai-bubble { max-width:88%; padding:0.65rem 0.9rem; border-radius:8px; font-size:0.85rem; line-height:1.55; }
+.ai-bubble-user { align-self:flex-end; background:var(--primary); color:#fff; }
+.ai-bubble-assistant { align-self:flex-start; background:rgba(255,255,255,0.06); color:rgba(250,250,250,0.85); border:1px solid rgba(255,255,255,0.08); }
+.ai-bubble-placeholder { color:rgba(250,250,250,0.35); font-size:0.88rem; padding:0.5rem 0; }
+.ai-bubble-chart { width:100%; margin-top:0.75rem; position:relative; height:180px; }
+.ai-overlay-footer { display:flex; gap:0.5rem; padding:0.75rem 1.25rem; border-top:1px solid rgba(255,255,255,0.08); flex-shrink:0; }
+.ai-input { flex:1; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); border-radius:6px; color:#fafafa; font-size:0.88rem; padding:0.5rem 0.75rem; outline:none; }
+.ai-input:focus { border-color:var(--primary); }
+.ai-send-btn { background:var(--primary); color:#fff; border:none; border-radius:6px; padding:0.5rem 1rem; font-size:0.88rem; font-weight:600; cursor:pointer; white-space:nowrap; }
+.ai-send-btn:disabled { opacity:0.5; cursor:not-allowed; }
+</style>
 
 {# ── Page header + month filter ───────────────────────────────────────── #}
 <div class="dash-header">
@@ -100,11 +168,11 @@
   {# Total Spending #}
   <div class="stat-card">
     <p class="stat-label">Total Spending</p>
-    <p class="stat-value">${{ "%.2f"|format(stats.total_spending) }}</p>
+    <p class="stat-value"><span class="stat-value-num">${{ "%.2f"|format(stats.total_spending) }}</span><span class="stat-period">{{ stats.period_label }}</span></p>
     <p class="stat-sub">Debits, excl. transfers</p>
     {% if comparison_deltas.total_spending_pct is not none %}
     <p class="stat-compare">
-      vs ${{ "%.2f"|format(comparison_deltas.total_spending_prev) }}
+      vs ${{ "%.2f"|format(comparison_deltas.total_spending_prev) }}<span class="stat-period">{{ comparison_stats.period_label }}</span>
       <span class="{{ 'comp-better' if comparison_deltas.total_spending_pct < 0 else 'comp-worse' }}">
         {{ '↑' if comparison_deltas.total_spending_pct > 0 else '↓' }}{{ "%.1f"|format(comparison_deltas.total_spending_pct|abs) }}%
       </span>
@@ -115,11 +183,11 @@
   {# Total Income #}
   <div class="stat-card stat-good">
     <p class="stat-label">Total Income</p>
-    <p class="stat-value">${{ "%.2f"|format(stats.total_income) }}</p>
+    <p class="stat-value"><span class="stat-value-num">${{ "%.2f"|format(stats.total_income) }}</span><span class="stat-period">{{ stats.period_label }}</span></p>
     <p class="stat-sub">Income category only</p>
     {% if comparison_deltas.total_income_pct is not none %}
     <p class="stat-compare">
-      vs ${{ "%.2f"|format(comparison_deltas.total_income_prev) }}
+      vs ${{ "%.2f"|format(comparison_deltas.total_income_prev) }}<span class="stat-period">{{ comparison_stats.period_label }}</span>
       <span class="{{ 'comp-better' if comparison_deltas.total_income_pct > 0 else 'comp-worse' }}">
         {{ '↑' if comparison_deltas.total_income_pct > 0 else '↓' }}{{ "%.1f"|format(comparison_deltas.total_income_pct|abs) }}%
       </span>
@@ -131,17 +199,17 @@
   {% if stats.savings_rate is none %}
   <div class="stat-card">
     <p class="stat-label">Savings Rate</p>
-    <p class="stat-value">—</p>
+    <p class="stat-value"><span class="stat-value-num">—</span></p>
     <p class="stat-sub">No income recorded</p>
   </div>
   {% elif stats.savings_rate < 0 %}
   <div class="stat-card stat-danger">
     <p class="stat-label">Savings Rate</p>
-    <p class="stat-value">{{ "%.1f"|format(stats.savings_rate) }}%</p>
+    <p class="stat-value"><span class="stat-value-num">{{ "%.1f"|format(stats.savings_rate) }}%</span><span class="stat-period">{{ stats.period_label }}</span></p>
     <p class="stat-sub">Spent more than earned</p>
     {% if comparison_deltas.savings_rate_delta is not none %}
     <p class="stat-compare">
-      vs {{ "%.1f"|format(comparison_deltas.savings_rate_prev) if comparison_deltas.savings_rate_prev is not none else '—' }}%
+      vs {{ "%.1f"|format(comparison_deltas.savings_rate_prev) if comparison_deltas.savings_rate_prev is not none else '—' }}%<span class="stat-period">{{ comparison_stats.period_label }}</span>
       <span class="{{ 'comp-better' if comparison_deltas.savings_rate_delta > 0 else 'comp-worse' if comparison_deltas.savings_rate_delta < 0 else '' }}">
         {{ '↑' if comparison_deltas.savings_rate_delta > 0 else '↓' }}{{ "%.1f"|format(comparison_deltas.savings_rate_delta|abs) }} pp
       </span>
@@ -151,11 +219,11 @@
   {% elif stats.savings_rate >= 20 %}
   <div class="stat-card stat-good">
     <p class="stat-label">Savings Rate</p>
-    <p class="stat-value">{{ "%.1f"|format(stats.savings_rate) }}%</p>
+    <p class="stat-value"><span class="stat-value-num">{{ "%.1f"|format(stats.savings_rate) }}%</span><span class="stat-period">{{ stats.period_label }}</span></p>
     <p class="stat-sub">${{ "%.2f"|format(stats.savings) }} saved</p>
     {% if comparison_deltas.savings_rate_delta is not none %}
     <p class="stat-compare">
-      vs {{ "%.1f"|format(comparison_deltas.savings_rate_prev) if comparison_deltas.savings_rate_prev is not none else '—' }}%
+      vs {{ "%.1f"|format(comparison_deltas.savings_rate_prev) if comparison_deltas.savings_rate_prev is not none else '—' }}%<span class="stat-period">{{ comparison_stats.period_label }}</span>
       <span class="{{ 'comp-better' if comparison_deltas.savings_rate_delta > 0 else 'comp-worse' if comparison_deltas.savings_rate_delta < 0 else '' }}">
         {{ '↑' if comparison_deltas.savings_rate_delta > 0 else '↓' }}{{ "%.1f"|format(comparison_deltas.savings_rate_delta|abs) }} pp
       </span>
@@ -165,11 +233,11 @@
   {% else %}
   <div class="stat-card stat-warn">
     <p class="stat-label">Savings Rate</p>
-    <p class="stat-value">{{ "%.1f"|format(stats.savings_rate) }}%</p>
+    <p class="stat-value"><span class="stat-value-num">{{ "%.1f"|format(stats.savings_rate) }}%</span><span class="stat-period">{{ stats.period_label }}</span></p>
     <p class="stat-sub">${{ "%.2f"|format(stats.savings) }} saved</p>
     {% if comparison_deltas.savings_rate_delta is not none %}
     <p class="stat-compare">
-      vs {{ "%.1f"|format(comparison_deltas.savings_rate_prev) if comparison_deltas.savings_rate_prev is not none else '—' }}%
+      vs {{ "%.1f"|format(comparison_deltas.savings_rate_prev) if comparison_deltas.savings_rate_prev is not none else '—' }}%<span class="stat-period">{{ comparison_stats.period_label }}</span>
       <span class="{{ 'comp-better' if comparison_deltas.savings_rate_delta > 0 else 'comp-worse' if comparison_deltas.savings_rate_delta < 0 else '' }}">
         {{ '↑' if comparison_deltas.savings_rate_delta > 0 else '↓' }}{{ "%.1f"|format(comparison_deltas.savings_rate_delta|abs) }} pp
       </span>
@@ -181,10 +249,10 @@
   {# Transaction count #}
   <div class="stat-card">
     <p class="stat-label">Transactions</p>
-    <p class="stat-value">{{ stats.tx_count }}</p>
+    <p class="stat-value"><span class="stat-value-num">{{ stats.tx_count }}</span><span class="stat-period">{{ stats.period_label }}</span></p>
     <p class="stat-sub">Reviewed, excl. transfers</p>
     <p class="stat-compare">
-      vs {{ comparison_deltas.tx_count_prev }} txns
+      vs {{ comparison_deltas.tx_count_prev }} txns<span class="stat-period">{{ comparison_stats.period_label }}</span>
       {% if comparison_deltas.tx_count_delta != 0 %}
       <span>{{ '↑' if comparison_deltas.tx_count_delta > 0 else '↓' }}{{ comparison_deltas.tx_count_delta|abs }}</span>
       {% endif %}
@@ -194,13 +262,26 @@
 </div>
 
 {# ── Insights + Reimbursements side-by-side ───────────────────────────── #}
-{% if insights or selected_month %}
+{% if insights or ai_insight or selected_month %}
 <div class="dash-chart-row" style="grid-template-columns: 1fr 1fr; margin-bottom: 1rem;">
 
   {# Left: Insights #}
-  {% if insights %}
+  {% if insights or ai_insight %}
   <div class="dash-chart-card">
     <p class="chart-title">Insights <span class="chart-subtitle">{{ stats.period_label }}</span></p>
+    {# AI spending insight (Feature 3) #}
+    {% if ai_insight %}
+    <div class="insight-row insight-ai" id="ai-insight-row">
+      <span class="insight-icon" aria-hidden="true">✦</span>
+      <div style="flex:1;">
+        <p class="insight-title">Watch list</p>
+        <p class="insight-body" id="ai-insight-text">{{ ai_insight }}</p>
+      </div>
+      {% if selected_month %}
+      <button class="refresh-insight-btn" id="refresh-insight-btn" title="Refresh insight">↺</button>
+      {% endif %}
+    </div>
+    {% endif %}
     {% for card in insights %}
     <div class="insight-row insight-{{ card.type }}">
       <span class="insight-icon" aria-hidden="true">{% if card.type == 'good' %}✓{% else %}⚠{% endif %}</span>
@@ -290,6 +371,27 @@
 </div>
 {% endif %}
 
+{# ── Feature 4: Category Spending Trend ──────────────────────────────── #}
+<div class="dash-chart-full">
+  <p class="chart-title">Spending by Category
+    <span class="chart-subtitle">Last 12 months · toggle categories below</span>
+  </p>
+  <div id="cat-trend-controls" class="cat-trend-controls"></div>
+  <div style="position:relative; height:280px;">
+    <canvas id="cat-trend-chart" role="img" aria-label="Category spending trend line chart"></canvas>
+  </div>
+</div>
+
+{# ── Feature 1: Income Breakdown ──────────────────────────────────────── #}
+<div class="dash-chart-full">
+  <p class="chart-title">Income Breakdown
+    <span class="chart-subtitle">Last 12 months · by source</span>
+  </p>
+  <div style="position:relative; height:240px;">
+    <canvas id="income-breakdown-chart" role="img" aria-label="Income breakdown stacked bar chart"></canvas>
+  </div>
+</div>
+
 {# ── Monthly Spending Trend (line chart) ──────────────────────────────── #}
 <div class="dash-chart-full">
   <p class="chart-title">
@@ -298,6 +400,22 @@
   </p>
   <div style="position:relative; height:220px;">
     <canvas id="trend-chart" role="img" aria-label="Monthly spending trend line chart"></canvas>
+  </div>
+</div>
+
+{# ── Feature 2: AI Data Assistant FAB + overlay ───────────────────────── #}
+<button class="ai-fab" id="ai-fab" aria-label="Ask your data" title="Ask your data">✦</button>
+<div class="ai-overlay" id="ai-overlay" hidden>
+  <div class="ai-overlay-header">
+    <span class="ai-overlay-title">✦ Ask your data <span class="ai-context-label" id="ai-context-label">Last 6 months</span></span>
+    <button class="ai-overlay-close" id="ai-overlay-close" aria-label="Close">✕</button>
+  </div>
+  <div class="ai-thread" id="ai-thread">
+    <span class="ai-bubble-placeholder">How can I help you understand your finances?</span>
+  </div>
+  <div class="ai-overlay-footer">
+    <input class="ai-input" id="ai-input" type="text" placeholder="Ask anything about your finances…" autocomplete="off" />
+    <button class="ai-send-btn" id="ai-send-btn">Send →</button>
   </div>
 </div>
 
@@ -336,8 +454,12 @@
   let   comparisonCategoryData = {{ comparison_category_json | safe }};
   const categoryDetails      = {{ category_details_json | safe }};
   const trendData            = {{ trend_json | safe }};
+  const incomeSources        = {{ income_sources_json | safe }};
+  const categoryTrend        = {{ category_trend_json | safe }};
   const selectedMonth        = "{{ selected_month }}";
   const comparisonMonth      = "{{ comparison_month }}";
+  const selectedPeriodLabel  = "{{ stats.period_label }}";
+  const comparisonPeriodLabel = "{{ comparison_stats.period_label }}";
 
   // ── Global Chart.js defaults ─────────────────────────────────────────
   Chart.defaults.color       = 'rgba(250,250,250,0.5)';
@@ -507,14 +629,14 @@
 
     renderDonut(null);
 
-    // Update stat cards (value + comparison)
+    // Update stat cards (value + comparison) — target .stat-value-num to preserve .stat-period span
     document.querySelectorAll('.stat-card').forEach(el => {
       const label = el.querySelector('.stat-label');
       if (!label) return;
       const t = label.textContent.trim();
       if (t === 'Total Spending') {
-        const val = el.querySelector('.stat-value');
-        if (val) val.textContent = '$' + data.total_spending.toFixed(2);
+        const num = el.querySelector('.stat-value-num');
+        if (num) num.textContent = '$' + data.total_spending.toFixed(2);
         const cmp = el.querySelector('.stat-compare');
         if (cmp && data.comparison_total_spending != null) {
           const pct = data.comparison_total_spending
@@ -522,11 +644,11 @@
             : null;
           const arrow = pct !== null ? (pct > 0 ? '↑' : '↓') : '';
           const cls = pct !== null ? (pct < 0 ? 'comp-better' : 'comp-worse') : '';
-          cmp.innerHTML = `vs $${data.comparison_total_spending.toFixed(2)} <span class="${cls}">${arrow}${pct !== null ? Math.abs(pct).toFixed(1) + '%' : ''}</span>`;
+          cmp.innerHTML = `vs $${data.comparison_total_spending.toFixed(2)}<span class="stat-period">${comparisonPeriodLabel}</span> <span class="${cls}">${arrow}${pct !== null ? Math.abs(pct).toFixed(1) + '%' : ''}</span>`;
         }
       } else if (t === 'Total Income') {
-        const val = el.querySelector('.stat-value');
-        if (val) val.textContent = '$' + (data.total_income ?? 0).toFixed(2);
+        const num = el.querySelector('.stat-value-num');
+        if (num) num.textContent = '$' + (data.total_income ?? 0).toFixed(2);
         const cmp = el.querySelector('.stat-compare');
         if (cmp && data.comparison_total_income != null) {
           const pct = data.comparison_total_income
@@ -534,13 +656,13 @@
             : null;
           const arrow = pct !== null ? (pct > 0 ? '↑' : '↓') : '';
           const cls = pct !== null ? (pct > 0 ? 'comp-better' : 'comp-worse') : '';
-          cmp.innerHTML = `vs $${data.comparison_total_income.toFixed(2)} <span class="${cls}">${arrow}${pct !== null ? Math.abs(pct).toFixed(1) + '%' : ''}</span>`;
+          cmp.innerHTML = `vs $${data.comparison_total_income.toFixed(2)}<span class="stat-period">${comparisonPeriodLabel}</span> <span class="${cls}">${arrow}${pct !== null ? Math.abs(pct).toFixed(1) + '%' : ''}</span>`;
         }
       } else if (t === 'Savings Rate') {
-        const val = el.querySelector('.stat-value');
+        const num = el.querySelector('.stat-value-num');
         const sub = el.querySelector('.stat-sub');
-        if (val) {
-          val.textContent = (data.savings_rate === null || data.savings_rate === undefined)
+        if (num) {
+          num.textContent = (data.savings_rate === null || data.savings_rate === undefined)
             ? '—'
             : data.savings_rate.toFixed(1) + '%';
         }
@@ -553,7 +675,7 @@
           const delta = data.savings_rate - data.comparison_savings_rate;
           const arrow = delta > 0 ? '↑' : '↓';
           const cls = delta > 0 ? 'comp-better' : 'comp-worse';
-          cmp.innerHTML = `vs ${data.comparison_savings_rate.toFixed(1)}% <span class="${cls}">${arrow}${Math.abs(delta).toFixed(1)} pp</span>`;
+          cmp.innerHTML = `vs ${data.comparison_savings_rate.toFixed(1)}%<span class="stat-period">${comparisonPeriodLabel}</span> <span class="${cls}">${arrow}${Math.abs(delta).toFixed(1)} pp</span>`;
         }
       }
     });
@@ -768,8 +890,279 @@
 
   // Re-render after fonts load to fix legend clipping on first paint
   document.fonts.ready.then(() => {
-    if (trendChart) trendChart.resize();
+    if (trendChart)    trendChart.resize();
+    if (catTrendChart) catTrendChart.resize();
+    if (incomeChart)   incomeChart.resize();
   });
+
+  // ── Feature 4: Category Spending Trend ───────────────────────────────
+  let catTrendChart = null;
+  const catTrendEl  = document.getElementById('cat-trend-chart');
+  const catTrendControlsEl = document.getElementById('cat-trend-controls');
+
+  if (catTrendEl && categoryTrend && categoryTrend.labels) {
+    const allCatNames  = Object.keys(categoryTrend.categories || {});
+    // Default: top 3 by total spend
+    const catTotals    = allCatNames.map(c => ({ name: c, total: categoryTrend.categories[c].reduce((a, b) => a + b, 0) }));
+    catTotals.sort((a, b) => b.total - a.total);
+    const top3 = new Set(catTotals.slice(0, 3).map(c => c.name));
+    let selectedCats   = new Set(top3);
+    const _MAX_VISIBLE = 6;
+
+    function buildCatTrendDatasets() {
+      return [...selectedCats].map(name => ({
+        label: name,
+        data: categoryTrend.categories[name] || [],
+        borderColor: categoryColor(name),
+        backgroundColor: categoryColor(name) + '22',
+        pointBackgroundColor: categoryColor(name),
+        pointRadius: 3,
+        pointHoverRadius: 5,
+        tension: 0.35,
+        fill: false,
+      }));
+    }
+
+    function updateCatTrendMax() {
+      if (!catTrendChart) return;
+      const allVisible = [...selectedCats].flatMap(c => categoryTrend.categories[c] || []);
+      const mx = allVisible.length ? Math.max(...allVisible) : 100;
+      catTrendChart.options.scales.y.suggestedMax = mx * 1.2;
+      catTrendChart.update();
+    }
+
+    // Build checkbox controls
+    let hiddenCats = [];
+    catTotals.forEach((item, idx) => {
+      const lbl = document.createElement('label');
+      const chk = document.createElement('input');
+      chk.type = 'checkbox';
+      chk.checked = top3.has(item.name);
+      chk.style.accentColor = categoryColor(item.name);
+      chk.dataset.cat = item.name;
+      if (idx >= _MAX_VISIBLE) {
+        lbl.classList.add('cat-trend-hidden');
+        hiddenCats.push(lbl);
+      }
+      chk.addEventListener('change', () => {
+        if (chk.checked) selectedCats.add(item.name);
+        else selectedCats.delete(item.name);
+        if (catTrendChart) {
+          catTrendChart.data.datasets = buildCatTrendDatasets();
+          catTrendChart.update();
+          updateCatTrendMax();
+        }
+      });
+      lbl.appendChild(chk);
+      lbl.appendChild(document.createTextNode(' ' + item.name));
+      catTrendControlsEl.appendChild(lbl);
+    });
+
+    if (hiddenCats.length > 0) {
+      const showBtn = document.createElement('button');
+      showBtn.className = 'cat-trend-show-more';
+      showBtn.textContent = `+ ${hiddenCats.length} more`;
+      let expanded = false;
+      showBtn.addEventListener('click', () => {
+        expanded = !expanded;
+        hiddenCats.forEach(l => l.classList.toggle('cat-trend-hidden', !expanded));
+        showBtn.textContent = expanded ? '− less' : `+ ${hiddenCats.length} more`;
+      });
+      catTrendControlsEl.appendChild(showBtn);
+    }
+
+    const initMax = [...top3].flatMap(c => categoryTrend.categories[c] || []);
+    const mx0 = initMax.length ? Math.max(...initMax) : 100;
+
+    catTrendChart = new Chart(catTrendEl, {
+      type: 'line',
+      data: { labels: categoryTrend.labels, datasets: buildCatTrendDatasets() },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          datalabels: { display: false },
+          legend: {
+            position: 'top', align: 'end',
+            labels: { padding: 16, color: 'rgba(250,250,250,0.65)', usePointStyle: true, pointStyle: 'line', boxWidth: 20, font: { size: 11 } },
+          },
+          tooltip: { ...tooltipStyle, callbacks: { label: ctx => ' ' + ctx.dataset.label + ': ' + sgd(ctx.parsed.y) } },
+        },
+        scales: {
+          x: { grid: { color: 'rgba(255,255,255,0.04)' }, ticks: { color: 'rgba(250,250,250,0.4)', font: { size: 11 } } },
+          y: {
+            suggestedMax: mx0 * 1.2,
+            grid: { color: 'rgba(255,255,255,0.05)' },
+            ticks: { callback: v => sgdShort(v), color: 'rgba(250,250,250,0.4)' },
+          },
+        },
+      },
+    });
+  }
+
+  // ── Feature 1: Income Breakdown ───────────────────────────────────────
+  let incomeChart = null;
+  const incomeEl  = document.getElementById('income-breakdown-chart');
+
+  if (incomeEl && incomeSources && incomeSources.labels && incomeSources.labels.length > 0) {
+    const sourceNames = Object.keys(incomeSources.sources || {});
+    const incomeColors = [
+      '#0C5CAB', '#10b981', '#8b5cf6', '#f59e0b',
+      '#06b6d4', '#f97316', '#84cc16', '#6b7280',
+    ];
+
+    const incomeDatasets = sourceNames.map((src, i) => ({
+      label: src,
+      data: incomeSources.sources[src],
+      backgroundColor: incomeColors[i % incomeColors.length],
+      borderColor: '#09090b',
+      borderWidth: 1,
+      borderRadius: 3,
+      stack: 'income',
+    }));
+
+    incomeChart = new Chart(incomeEl, {
+      type: 'bar',
+      data: { labels: incomeSources.labels, datasets: incomeDatasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          datalabels: { display: false },
+          legend: {
+            position: 'bottom',
+            labels: { padding: 12, color: 'rgba(250,250,250,0.6)', boxWidth: 10, font: { size: 10 } },
+          },
+          tooltip: { ...tooltipStyle, callbacks: { label: ctx => ' ' + ctx.dataset.label + ': ' + sgd(ctx.parsed.y) } },
+        },
+        scales: {
+          x: { stacked: true, grid: { display: false }, ticks: { color: 'rgba(250,250,250,0.4)', font: { size: 10 } } },
+          y: { stacked: true, grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { callback: v => sgdShort(v), color: 'rgba(250,250,250,0.4)' } },
+        },
+      },
+    });
+  }
+
+  // ── Feature 3: Refresh AI insight ────────────────────────────────────
+  const refreshInsightBtn = document.getElementById('refresh-insight-btn');
+  if (refreshInsightBtn && selectedMonth) {
+    refreshInsightBtn.addEventListener('click', async () => {
+      refreshInsightBtn.textContent = '…';
+      refreshInsightBtn.disabled = true;
+      try {
+        const res = await fetch('/api/refresh-insight?month=' + selectedMonth, { method: 'POST' });
+        const data = await res.json();
+        if (data.ok) {
+          const textEl = document.getElementById('ai-insight-text');
+          if (textEl) {
+            textEl.textContent = data.insight || '(No notable patterns found)';
+          }
+        }
+      } catch (_) {}
+      refreshInsightBtn.textContent = '↺';
+      refreshInsightBtn.disabled = false;
+    });
+  }
+
+  // ── Feature 2: AI Data Assistant overlay ─────────────────────────────
+  const aiFab        = document.getElementById('ai-fab');
+  const aiOverlay    = document.getElementById('ai-overlay');
+  const aiClose      = document.getElementById('ai-overlay-close');
+  const aiThread     = document.getElementById('ai-thread');
+  const aiInput      = document.getElementById('ai-input');
+  const aiSendBtn    = document.getElementById('ai-send-btn');
+  let   aiChartCount = 0;
+
+  if (aiFab && aiOverlay) {
+    aiFab.addEventListener('click', () => { aiOverlay.hidden = false; aiInput && aiInput.focus(); });
+    aiClose.addEventListener('click', () => { aiOverlay.hidden = true; });
+    aiOverlay.addEventListener('click', e => { if (e.target === aiOverlay) aiOverlay.hidden = true; });
+
+    function appendBubble(html, cls) {
+      const div = document.createElement('div');
+      div.className = 'ai-bubble ' + cls;
+      div.innerHTML = html;
+      aiThread.appendChild(div);
+      aiThread.scrollTop = aiThread.scrollHeight;
+      return div;
+    }
+
+    async function sendQuestion() {
+      const q = aiInput.value.trim();
+      if (!q) return;
+      aiInput.value = '';
+      aiSendBtn.disabled = true;
+      appendBubble(q.replace(/&/g,'&amp;').replace(/</g,'&lt;'), 'ai-bubble-user');
+
+      const thinking = appendBubble('<em style="opacity:0.5">Thinking…</em>', 'ai-bubble-assistant');
+
+      try {
+        const res = await fetch('/api/ask', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ question: q, selected_month: selectedMonth }),
+        });
+        const data = await res.json();
+        thinking.remove();
+
+        const escaped = (data.text || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/\n/g,'<br>');
+        let html = `<p>${escaped}</p>`;
+
+        const bubble = appendBubble(html, 'ai-bubble-assistant');
+
+        if (data.answer_type === 'chart' && data.chart) {
+          const cid = 'ai-chart-' + (++aiChartCount);
+          const wrap = document.createElement('div');
+          wrap.className = 'ai-bubble-chart';
+          const canvas = document.createElement('canvas');
+          canvas.id = cid;
+          wrap.appendChild(canvas);
+          bubble.appendChild(wrap);
+
+          const ch = data.chart;
+          const ds = (ch.datasets || []).map((d, i) => ({
+            ...d,
+            backgroundColor: d.backgroundColor || (ch.type === 'doughnut'
+              ? ch.labels.map((l, j) => PALETTE[(i + j) % PALETTE.length])
+              : PALETTE[i % PALETTE.length]),
+            borderColor: ch.type === 'line' ? (PALETTE[i % PALETTE.length]) : '#09090b',
+            borderWidth: 1,
+            tension: ch.type === 'line' ? 0.35 : undefined,
+          }));
+
+          new Chart(canvas, {
+            type: ch.type,
+            data: { labels: ch.labels, datasets: ds },
+            options: {
+              responsive: true, maintainAspectRatio: false,
+              plugins: {
+                datalabels: { display: false },
+                legend: { position: 'bottom', labels: { font: { size: 10 }, color: 'rgba(250,250,250,0.6)', padding: 8, boxWidth: 10 } },
+                title: ch.title ? { display: true, text: ch.title, color: 'rgba(250,250,250,0.55)', font: { size: 11 } } : undefined,
+                tooltip: { ...tooltipStyle, callbacks: { label: ctx => ' ' + sgd(ctx.parsed.y ?? ctx.parsed) } },
+              },
+              scales: ch.type !== 'doughnut' ? {
+                x: { grid: { color: 'rgba(255,255,255,0.04)' }, ticks: { color: 'rgba(250,250,250,0.4)', font: { size: 10 } } },
+                y: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { callback: v => sgdShort(v), color: 'rgba(250,250,250,0.4)' } },
+              } : undefined,
+            },
+          });
+          aiThread.scrollTop = aiThread.scrollHeight;
+        }
+      } catch (_) {
+        thinking.remove();
+        appendBubble('Sorry, something went wrong. Please try again.', 'ai-bubble-assistant');
+      }
+
+      aiSendBtn.disabled = false;
+      aiInput.focus();
+    }
+
+    aiSendBtn.addEventListener('click', sendQuestion);
+    aiInput.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendQuestion(); } });
+  }
 
   // ── Reimbursement category tag (AJAX) ───────────────────────────────
   document.querySelectorAll('.reimb-cat-select').forEach(sel => {
