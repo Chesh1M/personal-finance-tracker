@@ -44,10 +44,17 @@
 }
 .ai-fab:hover { transform:scale(1.05); box-shadow:0 6px 24px rgba(12,92,171,0.6); }
 .ai-overlay {
-  position:fixed; inset:2rem; z-index:1001;
+  display:none; /* shown via .is-open */
+  position:fixed; z-index:1001;
+  top:50%; left:50%; transform:translate(-50%,-50%);
+  width:66vw; height:75vh; max-width:1040px; min-width:320px;
   background:#111113; border:1px solid rgba(255,255,255,0.1);
-  border-radius:12px; display:flex; flex-direction:column;
+  border-radius:12px; flex-direction:column;
   box-shadow:0 20px 60px rgba(0,0,0,0.6); overflow:hidden;
+}
+.ai-overlay.is-open { display:flex; }
+@media (max-width:768px) {
+  .ai-overlay { top:0; left:0; transform:none; width:100%; height:100%; max-width:none; border-radius:0; }
 }
 .ai-overlay-header {
   display:flex; align-items:center;
@@ -408,7 +415,7 @@
 
 {# ── Feature 2: AI Data Assistant FAB + overlay ───────────────────────── #}
 <button class="ai-fab" id="ai-fab" aria-label="Ask your data" title="Ask your data">✦</button>
-<div class="ai-overlay" id="ai-overlay" hidden>
+<div class="ai-overlay" id="ai-overlay">
   <div class="ai-overlay-header">
     <span class="ai-overlay-title">✦ Ask your data <span class="ai-context-label" id="ai-context-label">Last 6 months</span></span>
     <button class="ai-overlay-close" id="ai-overlay-close" aria-label="Close">✕</button>
@@ -1077,11 +1084,12 @@
   const aiInput      = document.getElementById('ai-input');
   const aiSendBtn    = document.getElementById('ai-send-btn');
   let   aiChartCount = 0;
+  let   aiHistory    = []; // [{role:'user'|'assistant', content:str}]
 
   if (aiFab && aiOverlay) {
-    aiFab.addEventListener('click', () => { aiOverlay.hidden = false; aiInput && aiInput.focus(); });
-    aiClose.addEventListener('click', () => { aiOverlay.hidden = true; });
-    aiOverlay.addEventListener('click', e => { if (e.target === aiOverlay) aiOverlay.hidden = true; });
+    aiFab.addEventListener('click', () => { aiOverlay.classList.add('is-open'); aiInput && aiInput.focus(); });
+    aiClose.addEventListener('click', () => { aiOverlay.classList.remove('is-open'); });
+    aiOverlay.addEventListener('click', e => { if (e.target === aiOverlay) aiOverlay.classList.remove('is-open'); });
 
     function appendBubble(html, cls) {
       const div = document.createElement('div');
@@ -1098,6 +1106,7 @@
       aiInput.value = '';
       aiSendBtn.disabled = true;
       appendBubble(q.replace(/&/g,'&amp;').replace(/</g,'&lt;'), 'ai-bubble-user');
+      aiHistory.push({ role: 'user', content: q });
 
       const thinking = appendBubble('<em style="opacity:0.5">Thinking…</em>', 'ai-bubble-assistant');
 
@@ -1105,12 +1114,19 @@
         const res = await fetch('/api/ask', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ question: q, selected_month: selectedMonth }),
+          body: JSON.stringify({
+            question: q,
+            selected_month: selectedMonth,
+            history: aiHistory.slice(-14), // last 7 exchanges
+          }),
         });
         const data = await res.json();
         thinking.remove();
 
-        const escaped = (data.text || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/\n/g,'<br>');
+        const replyText = data.text || '';
+        aiHistory.push({ role: 'assistant', content: replyText });
+
+        const escaped = replyText.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/\n/g,'<br>');
         let html = `<p>${escaped}</p>`;
 
         const bubble = appendBubble(html, 'ai-bubble-assistant');

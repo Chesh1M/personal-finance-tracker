@@ -113,10 +113,23 @@ async def api_ask(
         "transactions":      tx_list,
     }
 
+    # Parse and validate conversation history from client
+    raw_history = body.get("history", [])
+    safe_history: list[dict] = []
+    if isinstance(raw_history, list):
+        for msg in raw_history:
+            if (
+                isinstance(msg, dict)
+                and msg.get("role") in ("user", "assistant")
+                and isinstance(msg.get("content"), str)
+            ):
+                safe_history.append({"role": msg["role"], "content": msg["content"][:1200]})
+
     system_prompt = (
         "You are a personal finance assistant for a user in Singapore. "
         "Answer questions about their spending and income using ONLY the data provided. "
         "Be concise and specific — cite amounts and merchants where relevant. "
+        "Remember context from earlier in the conversation when answering follow-up questions. "
         "When the question asks for a breakdown, comparison, or trend that is best shown visually, "
         "set answer_type to 'chart' and populate the chart field. Otherwise use 'text'. "
         "Always respond with valid JSON matching this schema exactly:\n"
@@ -124,22 +137,27 @@ async def api_ask(
         '"chart": {"type": "bar"|"line"|"doughnut", "title": "...", '
         '"labels": [...], "datasets": [{"label": "...", "data": [...]}]} | null}'
     )
-    user_prompt = (
-        f"Context: {json.dumps(context_payload)}\n\n"
-        f"Question: {question}"
-    )
+
+    # Build messages: system → data context primer → conversation history → current question
+    messages: list[dict] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": f"Here is my financial data for context:\n{json.dumps(context_payload)}"},
+        {"role": "assistant", "content": "Understood. I have your financial data and am ready to answer your questions."},
+    ]
+    # Prior turns (all history entries except the last, which is the current question)
+    for msg in safe_history[:-1]:
+        messages.append(msg)
+    # Current question
+    messages.append({"role": "user", "content": question})
 
     try:
         client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"), timeout=45.0)
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_prompt},
-            ],
+            messages=messages,
             response_format={"type": "json_object"},
             temperature=0,
-            max_tokens=600,
+            max_tokens=800,
         )
         result = json.loads(resp.choices[0].message.content)
         return JSONResponse(result)
