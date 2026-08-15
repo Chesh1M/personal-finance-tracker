@@ -58,9 +58,13 @@ app.include_router(balances.router)
 # app.include_router(portfolio.router)
 
 
+import logging as _logging
+_unhandled_logger = _logging.getLogger("app.unhandled")
+
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
     """Last-resort handler so unhandled exceptions never show a blank page."""
+    _unhandled_logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
     is_production = os.getenv("ENVIRONMENT", "development") == "production"
     detail = "An unexpected error occurred. Please try again." if is_production else str(exc)
     html = f"""<!doctype html><html lang="en">

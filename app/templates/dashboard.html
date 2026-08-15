@@ -262,24 +262,27 @@
 </div>
 
 {# ── Insights + Reimbursements side-by-side ───────────────────────────── #}
-{% if insights or ai_insight or selected_month %}
+{% if insights or selected_month %}
 <div class="dash-chart-row" style="grid-template-columns: 1fr 1fr; margin-bottom: 1rem;">
 
   {# Left: Insights #}
-  {% if insights or ai_insight %}
+  {% if insights or selected_month %}
   <div class="dash-chart-card">
     <p class="chart-title">Insights <span class="chart-subtitle">{{ stats.period_label }}</span></p>
-    {# AI spending insight (Feature 3) #}
-    {% if ai_insight %}
+    {# Feature 3: AI spending insight — always shown when a month is selected #}
+    {% if selected_month %}
     <div class="insight-row insight-ai" id="ai-insight-row">
       <span class="insight-icon" aria-hidden="true">✦</span>
       <div style="flex:1;">
         <p class="insight-title">Watch list</p>
-        <p class="insight-body" id="ai-insight-text">{{ ai_insight }}</p>
+        <p class="insight-body" id="ai-insight-text">
+          {% if ai_insight %}{{ ai_insight }}{% else %}<em style="opacity:0.45;">Click ↺ to generate a spending insight for this month.</em>{% endif %}
+        </p>
       </div>
-      {% if selected_month %}
-      <button class="refresh-insight-btn" id="refresh-insight-btn" title="Refresh insight">↺</button>
-      {% endif %}
+      <button class="refresh-insight-btn" id="refresh-insight-btn"
+              title="{% if ai_insight %}Refresh insight{% else %}Generate insight{% endif %}">
+        {% if ai_insight %}↺{% else %}✦{% endif %}
+      </button>
     </div>
     {% endif %}
     {% for card in insights %}

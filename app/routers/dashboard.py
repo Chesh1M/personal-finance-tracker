@@ -328,8 +328,18 @@ def dashboard(
     account_balances = analytics.get_account_balances(db, year, month_int, user_id)
     reimbursements   = analytics.get_reimbursements(db, year, month_int, user_id)
     insights         = analytics.get_insights(db, year, month_int, user_id)
-    income_sources   = analytics.get_income_by_source(db, year, month_int, user_id)
-    category_trend   = analytics.get_category_monthly_trend(db, year, month_int, user_id)
+    try:
+        income_sources = analytics.get_income_by_source(db, year, month_int, user_id)
+    except Exception:
+        logger.exception("get_income_by_source failed")
+        db.rollback()
+        income_sources = {"labels": [], "sources": {}}
+    try:
+        category_trend = analytics.get_category_monthly_trend(db, year, month_int, user_id)
+    except Exception:
+        logger.exception("get_category_monthly_trend failed")
+        db.rollback()
+        category_trend = {"labels": [], "categories": {}}
     spending_categories = (
         db.query(Category)
         .filter(Category.is_transfer == False, Category.name != "reimbursements")  # noqa: E712
@@ -337,27 +347,20 @@ def dashboard(
         .all()
     )
 
-    # ── AI spending insight (cached per user/month) ────────────────────────
+    # ── AI spending insight (read from cache only; generate via /api/refresh-insight) ──
     ai_insight: str | None = None
     if year and month_int:
-        existing_insight = (
-            db.query(AiMonthlyInsight)
-            .filter_by(user_id=user_id, year=year, month=month_int)
-            .first()
-        )
-        if existing_insight:
-            ai_insight = existing_insight.insight_text
-        elif stats["tx_count"] > 0:
-            ai_insight = analytics.generate_spending_insight(year, month_int, user_id, db)
-            try:
-                db.add(AiMonthlyInsight(
-                    user_id=user_id, year=year, month=month_int,
-                    insight_text=ai_insight,
-                    generated_at=datetime.now(timezone.utc),
-                ))
-                db.commit()
-            except Exception:
-                db.rollback()  # unique constraint race — fine to skip
+        try:
+            existing_insight = (
+                db.query(AiMonthlyInsight)
+                .filter_by(user_id=user_id, year=year, month=month_int)
+                .first()
+            )
+            if existing_insight:
+                ai_insight = existing_insight.insight_text
+        except Exception:
+            logger.exception("Failed to read AI insight from cache (table may not exist)")
+            db.rollback()  # reset session so subsequent queries are not affected
 
     # ── Gather comparison data ─────────────────────────────────────────────
     comparison_stats         = analytics.get_summary_stats(db, comp_year, comp_month_int, user_id)
