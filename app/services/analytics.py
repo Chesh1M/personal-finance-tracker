@@ -720,36 +720,24 @@ def get_insights(db: Session, year: int | None, month: int | None, user_id: int)
     return cards[:5]
 
 
-def get_income_by_source(
-    db: Session, year: int, month: int, user_id: int, n_months: int = 12
-) -> dict:
-    """Monthly income broken down by description for the last n_months ending at (year, month).
+def get_income_breakdown(db: Session, year: int, month: int, user_id: int) -> list[dict]:
+    """Income transactions for a single month grouped by description, sorted by amount desc.
 
-    Returns:
-        {
-            "labels":  ["Aug 2025", ..., "Jul 2026"],
-            "sources": {
-                "FAST Payment / ACME CORP": [5000.0, 5000.0, ...],
-                "Interest Earned":          [3.5, 2.8, ...],
-                "Other":                    [0.0, 100.0, ...],
-            }
-        }
-    Descriptions truncated to 40 chars. If more than 5 unique descriptions exist across
-    all months, the smallest contributors are collapsed into "Other".
+    Returns: [{"desc": "SALARY", "amount": 5000.0}, ...]
+    No collapsing — every distinct description is returned as-is.
     """
-    months = _prev_months(year, month, n_months)
-    start = _month_start(months[0][0], months[0][1])
-    end   = _month_end(months[-1][0], months[-1][1])
+    if not (year and month):
+        return []
 
     income_cat = db.query(Category).filter(Category.name == "income").first()
     if not income_cat:
-        labels = [_month_label(y, m) for y, m in months]
-        return {"labels": labels, "sources": {}}
+        return []
+
+    start = _month_start(year, month)
+    end   = _month_end(year, month)
 
     rows = (
         db.query(
-            extract("year",  Transaction.date).label("yr"),
-            extract("month", Transaction.date).label("mo"),
             Transaction.description.label("desc"),
             func.sum(func.abs(Transaction.amount)).label("total"),
         )
@@ -762,56 +750,12 @@ def get_income_by_source(
             Transaction.date >= start,
             Transaction.date <= end,
         )
-        .group_by(
-            extract("year",  Transaction.date),
-            extract("month", Transaction.date),
-            Transaction.description,
-        )
+        .group_by(Transaction.description)
+        .order_by(func.sum(func.abs(Transaction.amount)).desc())
         .all()
     )
 
-    # Build per-description totals to identify top N sources
-    desc_totals: dict[str, float] = {}
-    for r in rows:
-        desc = (r.desc or "")[:40]
-        desc_totals[desc] = desc_totals.get(desc, 0.0) + (r.total or 0.0)
-
-    _MAX_SOURCES = 5
-    if len(desc_totals) > _MAX_SOURCES:
-        sorted_descs = sorted(desc_totals, key=lambda d: desc_totals[d], reverse=True)
-        top_descs = set(sorted_descs[:_MAX_SOURCES])
-    else:
-        top_descs = set(desc_totals.keys())
-
-    # Index data by (year, month, description)
-    data: dict[tuple, dict[str, float]] = {}
-    for r in rows:
-        key = (int(r.yr), int(r.mo))
-        desc = (r.desc or "")[:40]
-        label = desc if desc in top_descs else "Other"
-        data.setdefault(key, {})
-        data[key][label] = data[key].get(label, 0.0) + (r.total or 0.0)
-
-    # Collect all source names (top_descs + "Other" if needed)
-    all_sources: list[str] = sorted(
-        top_descs, key=lambda d: desc_totals.get(d, 0.0), reverse=True
-    )
-    has_other = any(
-        desc not in top_descs
-        for desc in desc_totals
-    )
-    if has_other:
-        all_sources.append("Other")
-
-    labels = [_month_label(y, m) for y, m in months]
-    sources: dict[str, list[float]] = {s: [] for s in all_sources}
-
-    for y, m in months:
-        month_data = data.get((y, m), {})
-        for s in all_sources:
-            sources[s].append(round(month_data.get(s, 0.0), 2))
-
-    return {"labels": labels, "sources": sources}
+    return [{"desc": (r.desc or "")[:60], "amount": round(float(r.total or 0), 2)} for r in rows]
 
 
 def get_category_monthly_trend(

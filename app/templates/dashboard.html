@@ -474,7 +474,7 @@
   let   comparisonCategoryData = {{ comparison_category_json | safe }};
   const categoryDetails      = {{ category_details_json | safe }};
   const trendData            = {{ trend_json | safe }};
-  const incomeSources        = {{ income_sources_json | safe }};
+  const incomeBreakdown      = {{ income_breakdown_json | safe }};
   const categoryTrend        = {{ category_trend_json | safe }};
   const selectedMonth        = "{{ selected_month }}";
   const comparisonMonth      = "{{ comparison_month }}";
@@ -1023,16 +1023,12 @@
   // ── Income card breakdown popup (click ⓘ) ────────────────────────────
   const incomeBreakdownBtn = document.getElementById('income-breakdown-btn');
   const incomePopupEl      = document.getElementById('income-popup');
-  if (incomeBreakdownBtn && incomePopupEl && incomeSources && incomeSources.labels && incomeSources.labels.length > 0) {
-    const lastIdx      = incomeSources.labels.length - 1;
-    const currentLabel = incomeSources.labels[lastIdx];
-    const entries = Object.entries(incomeSources.sources || {})
-      .map(([desc, amounts]) => ({ desc, amount: amounts[lastIdx] || 0 }))
-      .filter(x => x.amount > 0)
-      .sort((a, b) => b.amount - a.amount);
+  if (incomeBreakdownBtn && incomePopupEl && Array.isArray(incomeBreakdown) && incomeBreakdown.length > 0) {
+    const entries = incomeBreakdown; // [{desc, amount}] already sorted by amount desc
 
     if (entries.length > 0) {
-      let html = `<div class="income-popup-title">Income · ${currentLabel}</div>`;
+      const periodLabel = selectedPeriodLabel || '';
+      let html = `<div class="income-popup-title">Income · ${periodLabel}</div>`;
       let total = 0;
       for (const e of entries) {
         html += `<div class="income-popup-row"><span>${e.desc.replace(/&/g,'&amp;').replace(/</g,'&lt;')}</span><span>+${sgd(e.amount)}</span></div>`;

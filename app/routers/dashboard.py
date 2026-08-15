@@ -347,11 +347,11 @@ def dashboard(
     reimbursements   = analytics.get_reimbursements(db, year, month_int, user_id)
     insights         = analytics.get_insights(db, year, month_int, user_id)
     try:
-        income_sources = analytics.get_income_by_source(db, year, month_int, user_id)
+        income_breakdown = analytics.get_income_breakdown(db, year, month_int, user_id)
     except Exception:
-        logger.exception("get_income_by_source failed")
+        logger.exception("get_income_breakdown failed")
         db.rollback()
-        income_sources = {"labels": [], "sources": {}}
+        income_breakdown = []
     try:
         category_trend = analytics.get_category_monthly_trend(db, year, month_int, user_id)
     except Exception:
@@ -442,7 +442,7 @@ def dashboard(
             "category_json":          json.dumps(category_data),
             "category_details_json":  json.dumps(category_details),
             "trend_json":             json.dumps(trend_data),
-            "income_sources_json":    json.dumps(income_sources),
+            "income_breakdown_json":  json.dumps(income_breakdown),
             "category_trend_json":    json.dumps(category_trend),
             "ai_insight":             ai_insight,
             "account_balances":       account_balances,
