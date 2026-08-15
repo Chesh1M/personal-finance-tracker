@@ -43,11 +43,13 @@
   border-radius:8px; padding:0.75rem 1rem;
   box-shadow:0 8px 32px rgba(0,0,0,0.6);
   min-width:220px; max-width:300px;
-  font-size:0.82rem; pointer-events:none;
+  font-size:0.82rem; pointer-events:auto;
 }
 .income-popup-title { font-weight:600; margin-bottom:0.5rem; color:rgba(250,250,250,0.55); font-size:0.72rem; text-transform:uppercase; letter-spacing:0.04em; }
 .income-popup-row { display:flex; justify-content:space-between; gap:1rem; padding:0.18rem 0; color:rgba(250,250,250,0.8); }
 .income-popup-total { border-top:1px solid rgba(255,255,255,0.1); margin-top:0.35rem; padding-top:0.35rem; font-weight:600; color:#10b981; }
+.income-breakdown-btn { background:none; border:none; color:rgba(250,250,250,0.35); font-size:0.78rem; cursor:pointer; padding:0 0.15rem; line-height:1; vertical-align:middle; }
+.income-breakdown-btn:hover, .income-breakdown-btn:focus { color:rgba(250,250,250,0.8); outline:none; }
 
 /* ── Feature 2: AI assistant FAB + overlay ─────────────────────────── */
 .ai-fab {
@@ -205,7 +207,7 @@
 
   {# Total Income #}
   <div class="stat-card stat-good" id="income-stat-card">
-    <p class="stat-label">Total Income</p>
+    <p class="stat-label">Total Income <button id="income-breakdown-btn" class="income-breakdown-btn" title="Show income breakdown" aria-label="Show income breakdown">ⓘ</button></p>
     <p class="stat-value"><span class="stat-value-num">${{ "%.2f"|format(stats.total_income) }}</span><span class="stat-period">{{ stats.period_label }}</span></p>
     <p class="stat-sub" id="income-stat-sub">Income category only</p>
     {% if comparison_deltas.total_income_pct is not none %}
@@ -1018,42 +1020,59 @@
     });
   }
 
-  // ── Income card hover popup ───────────────────────────────────────────
-  const incomeStatCard = document.getElementById('income-stat-card');
-  const incomePopupEl  = document.getElementById('income-popup');
-  const incomeStatSub  = document.getElementById('income-stat-sub');
-  if (incomeStatCard && incomePopupEl && incomeSources && incomeSources.labels && incomeSources.labels.length > 0) {
-    const lastIdx = incomeSources.labels.length - 1;
+  // ── Income card breakdown popup (click ⓘ) ────────────────────────────
+  const incomeBreakdownBtn = document.getElementById('income-breakdown-btn');
+  const incomePopupEl      = document.getElementById('income-popup');
+  if (incomeBreakdownBtn && incomePopupEl && incomeSources && incomeSources.labels && incomeSources.labels.length > 0) {
+    const lastIdx      = incomeSources.labels.length - 1;
     const currentLabel = incomeSources.labels[lastIdx];
     const entries = Object.entries(incomeSources.sources || {})
       .map(([desc, amounts]) => ({ desc, amount: amounts[lastIdx] || 0 }))
       .filter(x => x.amount > 0)
       .sort((a, b) => b.amount - a.amount);
 
-    if (entries.length > 1) {
+    if (entries.length > 0) {
       let html = `<div class="income-popup-title">Income · ${currentLabel}</div>`;
       let total = 0;
       for (const e of entries) {
         html += `<div class="income-popup-row"><span>${e.desc.replace(/&/g,'&amp;').replace(/</g,'&lt;')}</span><span>+${sgd(e.amount)}</span></div>`;
         total += e.amount;
       }
-      html += `<div class="income-popup-row income-popup-total"><span>Total</span><span>+${sgd(total)}</span></div>`;
+      if (entries.length > 1) {
+        html += `<div class="income-popup-row income-popup-total"><span>Total</span><span>+${sgd(total)}</span></div>`;
+      }
       incomePopupEl.innerHTML = html;
-      if (incomeStatSub) incomeStatSub.textContent = 'Income category only · hover for breakdown';
-      incomeStatCard.addEventListener('mouseenter', () => {
-        const rect = incomeStatCard.getBoundingClientRect();
-        // Position below card, clamp to viewport right edge
-        let left = rect.left;
+
+      function positionAndShow() {
+        const rect = incomeBreakdownBtn.getBoundingClientRect();
         const popupW = 260;
+        let left = rect.left;
         if (left + popupW > window.innerWidth - 12) left = window.innerWidth - popupW - 12;
-        incomePopupEl.style.left = left + 'px';
-        incomePopupEl.style.top  = (rect.bottom + 8) + 'px';
+        incomePopupEl.style.left    = left + 'px';
+        incomePopupEl.style.top     = (rect.bottom + 8) + 'px';
         incomePopupEl.style.display = 'block';
+      }
+
+      incomeBreakdownBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (incomePopupEl.style.display === 'block') {
+          incomePopupEl.style.display = 'none';
+        } else {
+          positionAndShow();
+        }
       });
-      incomeStatCard.addEventListener('mouseleave', () => {
-        incomePopupEl.style.display = 'none';
+
+      document.addEventListener('click', (e) => {
+        if (!incomePopupEl.contains(e.target) && e.target !== incomeBreakdownBtn) {
+          incomePopupEl.style.display = 'none';
+        }
       });
+    } else {
+      // No income data — hide the button
+      incomeBreakdownBtn.style.display = 'none';
     }
+  } else if (incomeBreakdownBtn) {
+    incomeBreakdownBtn.style.display = 'none';
   }
 
   // ── Feature 3: Refresh AI insight ────────────────────────────────────
