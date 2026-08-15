@@ -894,7 +894,7 @@ def generate_spending_insight(year: int, month: int, user_id: int, db: Session) 
     rows = (
         db.query(
             Transaction.description,
-            func.abs(Transaction.amount).label("amount"),
+            func.sum(func.abs(Transaction.amount)).label("amount"),
             func.count(Transaction.id).label("cnt"),
         )
         .filter(
@@ -906,7 +906,7 @@ def generate_spending_insight(year: int, month: int, user_id: int, db: Session) 
             Transaction.date <= end,
         )
         .group_by(Transaction.description)
-        .order_by(func.abs(Transaction.amount).desc())
+        .order_by(func.sum(func.abs(Transaction.amount)).desc())
         .limit(60)
         .all()
     )
