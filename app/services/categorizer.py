@@ -69,7 +69,7 @@ def batch_categorize_transactions(statement_id: int, db: Session) -> bool:
         if example_lines else ""
     )
 
-    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"), timeout=120.0, max_retries=6)
+    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"), timeout=120.0, max_retries=3)
     all_ok = True
 
     # Process in chunks so GPT output stays predictable regardless of statement size

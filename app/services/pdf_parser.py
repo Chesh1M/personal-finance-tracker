@@ -78,7 +78,7 @@ from openai import OpenAI
 
 # 90-second timeout per call. OpenAI default is 600s — a hung Vision request
 # would otherwise block the background thread for up to 10 minutes silently.
-client = OpenAI(timeout=180.0, max_retries=6)  # Vision (Stage 1) takes 60-120s; retries handle transient TPM exhaustion
+client = OpenAI(timeout=90.0, max_retries=3)  # 4-page batches complete in <60s; 3 retries handle transient 429s
 
 # ── Stage 1: Vision layout-detection schema ───────────────────────────────────
 _LAYOUT_SYSTEM_PROMPT = """You are a bank statement layout analyser.
@@ -333,37 +333,50 @@ def _get_page_text_lines(page, page_num: int) -> list[dict]:
     return result
 
 
-def _detect_layout(images: list[str], all_text_lines: list[list[dict]]) -> dict:
-    """Stage 1: one Vision call to detect transaction table layout across all pages.
+_STAGE1_BATCH_SIZE = 4  # pages per Vision call; keeps each request ~10k tokens, completes in <60s
 
-    Sends each page image alongside its native text lines so GPT can correlate
-    visual column positions with exact text content without guessing values.
+
+def _detect_layout(images: list[str], all_text_lines: list[list[dict]]) -> dict:
+    """Stage 1: Vision layout detection, processed in 4-page batches.
+
+    Batching prevents timeouts on long statements (a 12-page single call was
+    35k tokens and took 3+ minutes). Each 4-page batch is ~10k tokens and
+    completes in 30-60s. Results are merged into a single pages list.
     """
-    user_content: list[dict] = []
-    for i, (img, lines) in enumerate(zip(images, all_text_lines), start=1):
+    all_page_results: list[dict] = []
+
+    for batch_start in range(0, len(images), _STAGE1_BATCH_SIZE):
+        batch_images = images[batch_start : batch_start + _STAGE1_BATCH_SIZE]
+        batch_lines = all_text_lines[batch_start : batch_start + _STAGE1_BATCH_SIZE]
+
+        user_content: list[dict] = []
+        for i, (img, lines) in enumerate(zip(batch_images, batch_lines), start=batch_start + 1):
+            user_content.append({
+                "type": "text",
+                "text": f"=== Page {i} native text lines ===\n{json.dumps(lines, separators=(',', ':'))}",
+            })
+            user_content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{img}", "detail": "auto"},
+            })
         user_content.append({
             "type": "text",
-            "text": f"=== Page {i} native text lines ===\n{json.dumps(lines, separators=(',', ':'))}",
+            "text": "For each page, identify whether it contains a transaction table and the semantic role of each column.",
         })
-        user_content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/png;base64,{img}", "detail": "auto"},
-        })
-    user_content.append({
-        "type": "text",
-        "text": "For each page, identify whether it contains a transaction table and the semantic role of each column.",
-    })
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": _LAYOUT_SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-        temperature=0,
-        response_format=_LAYOUT_SCHEMA,
-    )
-    return json.loads(response.choices[0].message.content.strip())
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": _LAYOUT_SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0,
+            response_format=_LAYOUT_SCHEMA,
+        )
+        batch_result = json.loads(response.choices[0].message.content.strip())
+        all_page_results.extend(batch_result.get("pages", []))
+
+    return {"pages": all_page_results}
 
 
 # ── Stage 2: Deterministic PyMuPDF extraction ─────────────────────────────────
