@@ -355,7 +355,7 @@ def _detect_layout(images: list[str], all_text_lines: list[list[dict]]) -> dict:
     })
 
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": _LAYOUT_SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
