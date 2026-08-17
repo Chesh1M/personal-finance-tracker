@@ -333,15 +333,19 @@ def _get_page_text_lines(page, page_num: int) -> list[dict]:
     return result
 
 
-_STAGE1_BATCH_SIZE = 4  # pages per Vision call; keeps each request ~10k tokens, completes in <60s
+_STAGE1_BATCH_SIZE = 4    # pages per Vision call; smaller = faster, more resilient to timeouts
+_STAGE1_MAX_LINES = 50   # text lines per page sent to Stage 1 for column-header location
+# Stage 1 only needs to locate column headers (Date/Description/Withdrawal/…), which always
+# appear in the first 30-50 text lines of each page. The actual transaction extraction is done
+# by Stage 2 (PyMuPDF reading the full PDF) — this limit does NOT affect data completeness.
 
 
 def _detect_layout(images: list[str], all_text_lines: list[list[dict]]) -> dict:
     """Stage 1: Vision layout detection, processed in 4-page batches.
 
-    Batching prevents timeouts on long statements (a 12-page single call was
-    35k tokens and took 3+ minutes). Each 4-page batch is ~10k tokens and
-    completes in 30-60s. Results are merged into a single pages list.
+    Sends only the top 50 text lines per page (where column headers always live) to keep
+    each batch under ~7k tokens and well within both gpt-4o and gpt-4o-mini rate limits.
+    Stage 2 reads the full PDF independently, so no transaction data is affected.
     """
     all_page_results: list[dict] = []
 
@@ -353,7 +357,7 @@ def _detect_layout(images: list[str], all_text_lines: list[list[dict]]) -> dict:
         for i, (img, lines) in enumerate(zip(batch_images, batch_lines), start=batch_start + 1):
             user_content.append({
                 "type": "text",
-                "text": f"=== Page {i} native text lines ===\n{json.dumps(lines, separators=(',', ':'))}",
+                "text": f"=== Page {i} native text lines ===\n{json.dumps(lines[:_STAGE1_MAX_LINES], separators=(',', ':'))}",
             })
             user_content.append({
                 "type": "image_url",
