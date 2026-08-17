@@ -3,9 +3,12 @@ import hashlib
 import io as _io
 import csv as _csv
 import json
+import logging
 import re as _re
 from collections import defaultdict
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 _MONEY_RE = _re.compile(r"^\d[\d,]*\.\d{2}$")
 
@@ -339,15 +342,31 @@ _STAGE1_MAX_LINES = 50   # text lines per page sent to Stage 1 for column-header
 # appear in the first 30-50 text lines of each page. The actual transaction extraction is done
 # by Stage 2 (PyMuPDF reading the full PDF) — this limit does NOT affect data completeness.
 
+# Stage 1 MUST stay on gpt-4o, not gpt-4o-mini. OpenAI bills gpt-4o-mini image input at
+# 33.3x the token count of gpt-4o (base 2833 + 5667/tile vs 85 + 170/tile). An A4 page is
+# 6 tiles, so one page costs 1,105 tokens on gpt-4o but 36,835 on gpt-4o-mini — a 4-page
+# batch alone would be ~147k tokens and blow the 200k TPM bucket in two calls.
+# Keeping Stage 1 on gpt-4o also isolates it on the separate 30k gpt-4o TPM bucket, leaving
+# the full 200k gpt-4o-mini budget for Stage 3 + categorisation.
+_STAGE1_MODEL = "gpt-4o"
+
+# gpt-4o's TPM bucket is only 30k. At "auto" detail a page costs 1,105 image tokens, so
+# statements beyond ~15 pages would exhaust it. For those, drop to "low" detail (a flat 85
+# tokens/page, no tiling) — the native text lines carry the exact header strings and their
+# bounding boxes, so the image only needs to convey that a table is present.
+_STAGE1_LOWDETAIL_PAGE_THRESHOLD = 12
+
 
 def _detect_layout(images: list[str], all_text_lines: list[list[dict]]) -> dict:
     """Stage 1: Vision layout detection, processed in 4-page batches.
 
-    Sends only the top 50 text lines per page (where column headers always live) to keep
-    each batch under ~7k tokens and well within both gpt-4o and gpt-4o-mini rate limits.
+    Sends only the top 50 text lines per page (where column headers always live), which
+    keeps each 4-page batch to roughly 4x1,105 image + 4x850 text tokens (~8k) — safely
+    inside gpt-4o's 30k TPM bucket.
     Stage 2 reads the full PDF independently, so no transaction data is affected.
     """
     all_page_results: list[dict] = []
+    detail = "low" if len(images) > _STAGE1_LOWDETAIL_PAGE_THRESHOLD else "auto"
 
     for batch_start in range(0, len(images), _STAGE1_BATCH_SIZE):
         batch_images = images[batch_start : batch_start + _STAGE1_BATCH_SIZE]
@@ -361,7 +380,7 @@ def _detect_layout(images: list[str], all_text_lines: list[list[dict]]) -> dict:
             })
             user_content.append({
                 "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{img}", "detail": "auto"},
+                "image_url": {"url": f"data:image/png;base64,{img}", "detail": detail},
             })
         user_content.append({
             "type": "text",
@@ -369,13 +388,18 @@ def _detect_layout(images: list[str], all_text_lines: list[list[dict]]) -> dict:
         })
 
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=_STAGE1_MODEL,
             messages=[
                 {"role": "system", "content": _LAYOUT_SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
             ],
             temperature=0,
             response_format=_LAYOUT_SCHEMA,
+        )
+        logger.info(
+            "Stage 1 batch pages %d-%d: %d prompt tokens (%s)",
+            batch_start + 1, batch_start + len(batch_images),
+            response.usage.prompt_tokens if response.usage else -1, _STAGE1_MODEL,
         )
         batch_result = json.loads(response.choices[0].message.content.strip())
         all_page_results.extend(batch_result.get("pages", []))
@@ -639,6 +663,11 @@ def _parse_csv_with_gpt(table_csv: str, bank_source: str) -> dict:
         ],
         temperature=0,
         response_format=_RESPONSE_SCHEMA,
+    )
+    logger.info(
+        "Stage 3: %d prompt + %d completion tokens (gpt-4o-mini)",
+        response.usage.prompt_tokens if response.usage else -1,
+        response.usage.completion_tokens if response.usage else -1,
     )
     data = json.loads(response.choices[0].message.content.strip())
     return _extract_parsed_result(data)
