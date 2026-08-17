@@ -876,7 +876,7 @@ def generate_spending_insight(year: int, month: int, user_id: int, db: Session) 
     )
 
     try:
-        client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"), timeout=30.0)
+        client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"), timeout=30.0, max_retries=6)
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
