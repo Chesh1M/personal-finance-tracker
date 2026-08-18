@@ -1,278 +1,188 @@
+"""Bank statement PDF -> structured transactions.
+
+A single call to a reasoning model that reads the PDF natively. This replaced a
+three-stage pipeline (Vision layout detection -> PyMuPDF coordinate extraction ->
+GPT CSV structuring) whose geometry heuristics were a recurring source of silent
+data loss.
+"""
+
 import base64
 import hashlib
-import io as _io
-import csv as _csv
 import json
 import logging
-import re as _re
-from collections import defaultdict
+import os
 from datetime import datetime
+from pathlib import Path
+
+from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
-_MONEY_RE = _re.compile(r"^\d[\d,]*\.\d{2}$")
+# ── Configuration ─────────────────────────────────────────────────────────────
 
-_NON_TXN_DESCS = (
-    "balance brought forward", "balance b/f", "balance c/f",
-    "opening balance", "closing balance", "balance carried forward",
-    "total balance carried forward", "total balance",
-    "total debits", "total credits",
-)
+# The model reads the PDF natively, so accuracy depends almost entirely on it.
+# Overridable per-environment so a model change never needs a code deploy.
+_PARSER_MODEL = os.environ.get("STATEMENT_PARSER_MODEL", "gpt-5.6-terra")
+_REASONING_EFFORT = os.environ.get("STATEMENT_PARSER_EFFORT", "high")
+_SERVICE_TIER = os.environ.get("STATEMENT_PARSER_SERVICE_TIER", "default")
 
-# DBS/POSB page-footer pattern that appears at the bottom of every page:
-# "Transaction Details as of DD Mon YYYY Page N of M  PDS_MMCON_..."
-# These lines must never be absorbed into a transaction description.
-_FOOTER_RE = _re.compile(
-    r"Transaction Details as of"
-    r"|PDS_MMCON"
-    r"|\bPage \d+ of \d+\b"
-    r"|\b\d{1,2} of \d{1,3}\b",  # catches "9 of 11" when "Page" lands in a separate column
-    _re.IGNORECASE,
-)
+# A ~90-transaction statement produces ~12k output tokens, and high-effort
+# reasoning tokens also count against this budget. Generous on purpose: hitting
+# the cap truncates the transaction list, which _assert_complete turns into a
+# hard failure rather than a silent partial result.
+_MAX_OUTPUT_TOKENS = 32000
 
-_DATE_RE = _re.compile(
-    r"\b\d{2}[/\-]\d{2}[/\-]\d{2,4}\b"  # 31/05/2026 or 31-05-26
-    r"|\b\d{2}\s+\w{3}\s+\d{4}\b"        # 31 May 2026
-)
+# High-effort reasoning over a full statement runs for minutes, not seconds.
+# The old pipeline's 90s was sized for small per-page Vision calls.
+_PARSE_TIMEOUT = 600.0
 
 
-def _is_money_value(s: str) -> bool:
-    """Return True if s looks like a monetary amount (e.g. '1.40', '3,487.30')."""
-    return bool(_MONEY_RE.match(s.strip())) if s else False
+def _client() -> OpenAI:
+    """Build the OpenAI client lazily.
 
-
-def _compute_row_spacing(below: list, col_defs: list[dict]) -> float:
-    """Estimate row spacing from balance-column monetary value y-centers.
-
-    Uses only balance-column words so multi-word description lines don't skew the median.
-    Returns 0.0 if there are fewer than 3 balance values (can't estimate reliably).
+    Constructing it at module scope would require OPENAI_API_KEY to be present
+    at import time, which forces every test that imports the app to set a dummy key.
     """
-    balance_col = next((c for c in col_defs if c["field"] == "balance"), None)
-    if not balance_col:
-        return 0.0
-    bal_ys = sorted([
-        (w[1] + w[3]) / 2
-        for w in below
-        if balance_col["x_start"] <= (w[0] + w[2]) / 2 < balance_col["x_end"]
-        and _MONEY_RE.match(w[4].strip())
-    ])
-    if len(bal_ys) < 3:
-        return 0.0
-    gaps = [bal_ys[i + 1] - bal_ys[i]
-            for i in range(len(bal_ys) - 1)
-            if bal_ys[i + 1] - bal_ys[i] > 1.5]
-    return sorted(gaps)[len(gaps) // 2] if gaps else 0.0
+    return OpenAI(timeout=_PARSE_TIMEOUT, max_retries=2)
 
 
-def _has_date_value(s: str) -> bool:
-    """Return True if s contains a recognisable date pattern."""
-    return bool(_DATE_RE.search(s)) if s else False
+# ── Output schema ─────────────────────────────────────────────────────────────
 
+_ACCOUNT_TYPES = ["savings", "current", "credit_card", "paylah", "other"]
 
-def _clean_date_field(s: str) -> str:
-    """Strip noise (e.g. 'No. ', '/ ') from a date column value, keeping only the date."""
-    if not s:
-        return s
-    m = _DATE_RE.search(s)
-    return m.group(0) if m else s
-
-import pymupdf as fitz
-from openai import OpenAI
-
-# 90-second timeout per call. OpenAI default is 600s — a hung Vision request
-# would otherwise block the background thread for up to 10 minutes silently.
-client = OpenAI(timeout=90.0, max_retries=3)  # 4-page batches complete in <60s; 3 retries handle transient 429s
-
-# ── Stage 1: Vision layout-detection schema ───────────────────────────────────
-_LAYOUT_SYSTEM_PROMPT = """You are a bank statement layout analyser.
-You will receive page images of a bank statement alongside native text lines extracted from each page.
-Each page's text lines are a compact JSON array whose entries are [text, x0, y0, x1, y1],
-where the coordinates are PDF points with the origin at the top-left of the page.
-For each page, determine whether it contains a transaction table.
-If it does, identify the semantic role of each column by matching the column header text exactly as it appears.
-
-Do NOT extract any transaction values — only identify column structure.
-
-Field values for 'field':
-- "date": the transaction posting date column
-- "description": the merchant / narrative description column
-- "debit": money leaving the account (labelled Withdrawal, Debit, Dr, Payment, etc.)
-- "credit": money entering the account (labelled Deposit, Credit, Cr, Receipt, etc.)
-- "balance": running account balance (NOT a transaction amount)
-- "other": any column that does not fit the above
-
-If the page contains a transaction table, return table_bbox as [x0, y0, x1, y1] pixel coordinates
-in the rendered image. The bbox must span from the TOP of the column header row down to the BOTTOM
-of the LAST transaction data row — include the entire table body, not just the header. Exclude any
-page footers, page numbers, or summary tables (e.g. "Total Balance Carried Forward") that appear
-below the last transaction row. Return null for table_bbox if has_transaction_table is false."""
-
-_LAYOUT_SCHEMA = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "layout_detection",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "pages": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "page_number": {"type": "integer"},
-                            "has_transaction_table": {"type": "boolean"},
-                            "table_bbox": {
-                                "anyOf": [
-                                    {"type": "array", "items": {"type": "number"}},
-                                    {"type": "null"},
-                                ],
-                            },
-                            "columns": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "field": {
-                                            "type": "string",
-                                            "enum": ["date", "description", "debit", "credit", "balance", "other"],
-                                        },
-                                        "header_text": {"type": "string"},
-                                    },
-                                    "required": ["field", "header_text"],
-                                    "additionalProperties": False,
-                                },
-                            },
-                        },
-                        "required": ["page_number", "has_transaction_table", "table_bbox", "columns"],
-                        "additionalProperties": False,
-                    },
+# Consumed by app/routers/upload.py. Every field is required and strict, so the
+# model cannot omit a key that the insert loop reads.
+_TRANSACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "account_type": {"type": "string", "enum": _ACCOUNT_TYPES},
+        "closing_balance": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+        "transactions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string"},
+                    "transaction_date": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                    "description": {"type": "string"},
+                    "amount": {"type": "number"},
+                    "type": {"type": "string", "enum": ["debit", "credit"]},
+                    "account_type": {"type": "string", "enum": _ACCOUNT_TYPES},
+                    "is_transfer": {"type": "boolean"},
+                    "reference_id": {"anyOf": [{"type": "string"}, {"type": "null"}]},
                 },
+                "required": [
+                    "date", "transaction_date", "description", "amount",
+                    "type", "account_type", "is_transfer", "reference_id",
+                ],
+                "additionalProperties": False,
             },
-            "required": ["pages"],
-            "additionalProperties": False,
         },
     },
+    "required": ["account_type", "closing_balance", "transactions"],
+    "additionalProperties": False,
 }
 
-# ── Stage 3: CSV → structured JSON (gpt-4o-mini, text only) ──────────────────
-_SYSTEM_PROMPT_CSV = """You are a financial data extractor for Singapore bank statements.
-You will receive a CSV table extracted from a bank statement. The columns are already semantically labelled:
-- "date": posting date
-- "description": merchant or narrative
-- "debit": amount leaving the account (always a debit)
-- "credit": amount entering the account (always a credit)
-- "balance": running account balance — never use this as a transaction amount
-- "_type": pre-computed from which of debit/credit has a value — ALWAYS copy this directly
-  to the type field; never override it based on description text
-- "_amount": pre-computed positive float matching _type — ALWAYS copy this to the amount field;
-  never use the balance column value as the amount
+# ── Extraction prompt ─────────────────────────────────────────────────────────
 
-Rules:
-- Extract EVERY transaction row — do not skip any
-- type: copy _type exactly ("debit" or "credit") — do not infer from description
-- amount: parse _amount as a positive float — do not read from balance column
-- date: YYYY-MM-DD
-- transaction_date: YYYY-MM-DD or null
-- is_transfer: true for wallet top-ups, own-account transfers, credit card bill payments
-- reference_id: extract the LAST standalone numeric token (8+ digits) that is NOT formatted as a
-  hyphenated card number (e.g. "4628-4500-4754-4953"). For DBS "Debit Card Transaction" rows
-  this is the authorization/trace code on the final continuation line (e.g. "000002438222766").
-  This is the only field that distinguishes two same-merchant same-amount same-day transactions —
-  always extract it when present. Return null only when no such token exists.
-- account_type: infer from context — one of "savings", "current", "credit_card", "paylah", "other"
-- closing_balance: the last balance value in the balance column, or null if not available
-- description: merchant or narrative text only. Preserve the type prefix (e.g. "Debit Card
-  Transaction", "FAST Payment / Receipt", "Salary"). Strip card numbers (patterns like
-  "4628-4500-4754-4953"), bank registration codes (e.g. "SG400..."), page footer text
-  ("Transaction Details as of...", "Page X of Y"), and any technical identifiers or trailing
-  noise that is not part of the merchant name.
-- Rows with no date are continuation lines — merge description with the preceding transaction
-- Skip non-transaction rows: balance markers ("Balance Brought Forward", "Balance B/F",
-  "Balance C/F"), totals ("Total Balance Carried Forward", "Total Debits/Credits"), and any
-  summary row where the description signals a period summary rather than a merchant or payee"""
+# Rules 1-3 exist because app/routers/upload.py silently drops any transaction
+# with amount <= 0 or an unparseable date. Getting these wrong loses data with
+# no error, so they are stated first and repeated in the field list.
+_EXTRACTION_PROMPT = """You are a precise data extraction assistant for Singapore bank statements.
+The attached PDF is a single bank statement from: {bank}
 
-# ── Vision fallback: all pages as images → gpt-4o (original approach) ────────
-SYSTEM_PROMPT = """You are a financial data extractor for Singapore bank statements.
-Extract EVERY transaction from the provided bank statement and return a JSON object.
-Do not skip any transaction row. Your output must contain exactly as many transactions as appear in the statement.
-If unsure about a row, include it — never silently drop it.
+Extract EVERY individual transaction. Analyse the tabular layout and use the visual alignment of
+columns to decide which value belongs to which header (Date, Description, Withdrawal, Deposit,
+Balance, etc.). One row per transaction. If a description wraps across multiple lines, concatenate
+it into one continuous string.
 
-Top-level fields:
-- account_type: one of "savings", "current", "credit_card", "paylah", "other"
-- closing_balance: final balance at END of statement period; null if not visible.
+CRITICAL RULES — violating these silently corrupts the data:
 
-Each transaction must have:
-- date: YYYY-MM-DD posting date
-- transaction_date: YYYY-MM-DD or null
-- description: preserve type prefix, remove card numbers, keep reference in reference_id
-- amount: positive float
-- type: "debit" or "credit"
-- account_type: one of the enum values
-- is_transfer: boolean
-- reference_id: string or null
+1. `amount` is ALWAYS a positive number. Never emit a negative value, never include currency
+   symbols, thousands separators, or CR/DR text. Direction is carried by `type`, never by sign.
 
-DETERMINING DEBIT vs CREDIT:
-DBS/POSB: separate Withdrawal and Deposit columns.
-- Withdrawal column value → type = "debit"
-- Deposit column value → type = "credit"
-- Balance column is running balance — never treat as transaction amount.
-Credit cards: charges = debit, payments/refunds = credit.
+2. `type` is exactly "debit" or "credit", and is decided ONLY by WHICH COLUMN the amount sits
+   in (or by the CR/DR marker) — NEVER by the wording of the description:
+   - "debit"  = the amount appears in the Withdrawal / Debit / Paid Out column, or is marked DR
+   - "credit" = the amount appears in the Deposit / Credit / Paid In column, or is marked CR
+   Read the amount's horizontal position against the column headers and use that alone.
+   IMPORTANT: a description's wording is NOT evidence of direction. A row labelled
+   "Debit Card Transaction" is frequently a REFUND sitting in the Deposit column, and must then
+   be "credit". Likewise "Funds Transfer" and "PayNow" rows occur in both directions. If the
+   description seems to contradict the column, THE COLUMN WINS.
+   Never place the same amount in both columns, and never read a value from the Balance column.
 
-is_transfer true: PayLah/GrabPay top-ups, own-account transfers, credit card bill payments, own-account PayNow/FAST.
-is_transfer false: merchant spending, salary, interest, PayNow from friends."""
+3. CR/DR notation: some statements (e.g. PayLah!) mark amounts with a "CR" or "DR" suffix or
+   prefix instead of using separate Withdrawal/Deposit columns. Use that marker to set `type`,
+   and strip the marker out of `amount` entirely — it must never appear in the numeric output.
+   When the statement DOES have separate Withdrawal/Deposit columns, derive `type` from which
+   column the value sits in, and use any CR/DR marker only to confirm it.
 
-_RESPONSE_SCHEMA = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "bank_statement",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "account_type": {
-                    "type": "string",
-                    "enum": ["savings", "current", "credit_card", "paylah", "other"],
-                },
-                "closing_balance": {"anyOf": [{"type": "number"}, {"type": "null"}]},
-                "transactions": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "date": {"type": "string"},
-                            "transaction_date": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                            "description": {"type": "string"},
-                            "amount": {"type": "number"},
-                            "type": {"type": "string", "enum": ["debit", "credit"]},
-                            "account_type": {
-                                "type": "string",
-                                "enum": ["savings", "current", "credit_card", "paylah", "other"],
-                            },
-                            "is_transfer": {"type": "boolean"},
-                            "reference_id": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                        },
-                        "required": [
-                            "date", "transaction_date", "description", "amount",
-                            "type", "account_type", "is_transfer", "reference_id",
-                        ],
-                        "additionalProperties": False,
-                    },
-                },
-            },
-            "required": ["account_type", "closing_balance", "transactions"],
-            "additionalProperties": False,
-        },
-    },
-}
+FIELDS:
+- `date`: posting date, formatted YYYY-MM-DD.
+- `transaction_date`: the actual transaction date as YYYY-MM-DD when the statement shows one
+  distinct from the posting date; otherwise null.
+- `description`: merchant or narrative text. PRESERVE the leading type prefix when present
+  (e.g. "Debit Card Transaction", "FAST Payment / Receipt", "Funds Transfer", "Salary",
+  "Interest Earned"), and preserve the merchant name including its country/city token
+  (e.g. "CHAGEE SINGAPORE SGP").
+  This field is used to recognise recurring merchants across statements, so it MUST be
+  IDENTICAL for two visits to the same merchant. Therefore EXCLUDE everything that varies
+  per transaction:
+    * the reference / authorisation / trace number (that belongs in `reference_id` only —
+      never repeat it here, e.g. "TF664201777704282661", "000002370939626")
+    * trailing transaction-date codes such as "27APR", "28MAY"
+    * card numbers (e.g. "4628-4500-4754-4953") and bank registration codes
+    * page footers ("Transaction Details as of...", "Page X of Y", "PDS_MMCON...")
+  Example: the row "Debit Card Transaction SHOPEE SINGAPORE MP SI SGP 27APR 000002370939626"
+  yields description "Debit Card Transaction SHOPEE SINGAPORE MP SI SGP" and
+  reference_id "000002370939626".
+- `amount`: positive number (see rule 1).
+- `type`: "debit" or "credit" (see rules 2-3).
+- `reference_id`: the transaction reference or authorisation/trace number when visible in the
+  row, otherwise null. This is the ONLY thing distinguishing two transactions with the same
+  merchant, date and amount, so always extract it when present. Never use a card number.
+- `is_transfer`: true for movements between the user's own accounts — wallet/PayLah! top-ups,
+  inter-account transfers, credit card bill payments. False for merchant spending, salary,
+  interest earned, and incoming PayNow from other people.
+- `account_type`: one of savings, current, credit_card, paylah, other.
+
+STATEMENT-LEVEL FIELDS:
+- `closing_balance`: the final closing balance of the statement, or null if not shown.
+- `account_type`: the account type for the statement as a whole.
+
+EXCLUDE non-transaction rows entirely: "Balance Brought Forward", "Balance B/F", "Balance C/F",
+"Total Balance Carried Forward", opening/closing balance lines, subtotals, period summaries,
+page headers and footers, bank addresses and marketing text.
+
+Extract every transaction row. Do not skip, summarise, or truncate the list."""
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Parsing ───────────────────────────────────────────────────────────────────
+
+def _assert_complete(response) -> None:
+    """Raise if the model returned a truncated or empty result.
+
+    A partial extraction that reports success is the worst possible outcome: it
+    reaches the review page looking plausible. Raising here propagates to the
+    Phase A handler in upload.py, which marks the statement "failed".
+    """
+    status = getattr(response, "status", None)
+    if status == "incomplete":
+        reason = getattr(getattr(response, "incomplete_details", None), "reason", "unknown")
+        raise ValueError(
+            f"Model returned an incomplete response (reason: {reason}). "
+            f"The transaction list was cut off, so the result is not trustworthy."
+        )
+    if not (response.output_text or "").strip():
+        raise ValueError(f"Model returned no output (status: {status}).")
+
 
 def _extract_parsed_result(data: dict) -> dict:
+    """Normalise the model's JSON into the dict shape upload.py consumes."""
     transactions = data.get("transactions", []) if isinstance(data, dict) else data
     if not isinstance(transactions, list):
-        raise ValueError(f"Unexpected GPT response shape: {type(transactions)}")
+        raise ValueError(f"Unexpected response shape: {type(transactions)}")
     closing_balance = None
     if isinstance(data, dict):
         raw_cb = data.get("closing_balance")
@@ -285,550 +195,74 @@ def _extract_parsed_result(data: dict) -> dict:
     return {"transactions": transactions, "closing_balance": closing_balance, "account_type": account_type}
 
 
-def pdf_to_base64_images(pdf_path: str, dpi: int = 150) -> list[str]:
-    """Render each PDF page to a base64-encoded PNG."""
-    doc = fitz.open(pdf_path)
-    mat = fitz.Matrix(dpi / 72, dpi / 72)
-    images = []
-    for page in doc:
-        pix = page.get_pixmap(matrix=mat)
-        images.append(base64.b64encode(pix.tobytes("png")).decode())
-    doc.close()
-    if not images:
-        raise ValueError("No pages could be rendered from this PDF.")
-    return images
-
-
-# ── Stage 1: Vision layout detection ─────────────────────────────────────────
-
-def _get_page_text_lines(page, page_num: int) -> list[dict]:
-    """Extract native text lines with bounding boxes from a PyMuPDF page.
-
-    Groups words by their (block_no, line_no) to reconstruct multi-word lines.
-    Returns compact dicts for inclusion in the Vision call payload.
-    """
-    words = page.get_text("words", sort=True)
-    # Each word tuple: (x0, y0, x1, y1, word_text, block_no, line_no, word_no)
-
-    line_buckets: dict[tuple, dict] = defaultdict(
-        lambda: {"words": [], "x0": 1e9, "y0": 1e9, "x1": 0.0, "y1": 0.0}
-    )
-    for x0, y0, x1, y1, word_text, block_no, line_no, word_no in words:
-        key = (int(block_no), int(line_no))
-        line_buckets[key]["words"].append((int(word_no), word_text))
-        line_buckets[key]["x0"] = min(line_buckets[key]["x0"], x0)
-        line_buckets[key]["y0"] = min(line_buckets[key]["y0"], y0)
-        line_buckets[key]["x1"] = max(line_buckets[key]["x1"], x1)
-        line_buckets[key]["y1"] = max(line_buckets[key]["y1"], y1)
-
-    result = []
-    sorted_keys = sorted(line_buckets, key=lambda k: (line_buckets[k]["y0"], line_buckets[k]["x0"]))
-    for i, key in enumerate(sorted_keys):
-        data = line_buckets[key]
-        text = " ".join(w for _, w in sorted(data["words"]))
-        if text.strip():
-            result.append({
-                "id": f"p{page_num}_L{i}",
-                "text": text.strip(),
-                "x0": round(data["x0"], 1),
-                "y0": round(data["y0"], 1),
-                "x1": round(data["x1"], 1),
-                "y1": round(data["y1"], 1),
-            })
-    return result
-
-
-_STAGE1_BATCH_SIZE = 4    # pages per Vision call; smaller = faster, more resilient to timeouts
-
-# NEVER truncate the per-page text lines sent to Stage 1. Stage 1 must return table_bbox
-# spanning down to the LAST transaction row, and it derives that bottom edge from these
-# lines. Truncating them makes the bbox too short, which then trips the partial-table guard
-# in _extract_rows_from_page (table_y_end / page_height < 0.35) and silently discards most
-# of every page — a 50-line cap cut may26_dbs.pdf from 93 rows to 10.
-# Token cost is controlled by _slim_lines_for_stage1 instead, which is lossless per line.
-
-
-def _slim_lines_for_stage1(lines: list[dict]) -> list[list]:
-    """Shrink the Stage 1 text-line payload without dropping any lines.
-
-    Encodes each line as a positional [text, x0, y0, x1, y1] array instead of a dict
-    with an unused 'id' key and fractional coordinates. This is ~65% smaller than the
-    dict form while preserving every line, so the model still sees the true bottom of
-    the table. Measured on may26_dbs.pdf: 29.3k -> 17.7k Stage 1 tokens, still 93 rows.
-    """
-    return [
-        [l["text"], int(l["x0"]), int(l["y0"]), int(l["x1"]), int(l["y1"])]
-        for l in lines
-    ]
-
-# Stage 1 MUST stay on gpt-4o, not gpt-4o-mini. OpenAI bills gpt-4o-mini image input at
-# 33.3x the token count of gpt-4o (base 2833 + 5667/tile vs 85 + 170/tile). An A4 page is
-# 6 tiles, so one page costs 1,105 tokens on gpt-4o but 36,835 on gpt-4o-mini — a 4-page
-# batch alone would be ~147k tokens and blow the 200k TPM bucket in two calls.
-# Keeping Stage 1 on gpt-4o also isolates it on the separate 30k gpt-4o TPM bucket, leaving
-# the full 200k gpt-4o-mini budget for Stage 3 + categorisation.
-_STAGE1_MODEL = "gpt-4o"
-
-# gpt-4o's TPM bucket is only 30k, so image detail is scaled to page count. "auto" costs
-# 1,105 tokens/page (6 tiles) and "low" a flat 85. Verified on may26_dbs.pdf that "low"
-# still yields the correct 93 rows — the text lines carry the layout signal, the image only
-# needs to confirm a table is present. Small statements keep "auto" for maximum fidelity on
-# unfamiliar bank layouts, where the token cost is irrelevant anyway.
-# Never trim text lines to save tokens: they are what determine table_bbox.
-_STAGE1_AUTODETAIL_MAX_PAGES = 6
-
-
-def _detect_layout(images: list[str], all_text_lines: list[list[dict]]) -> dict:
-    """Stage 1: Vision layout detection, processed in 4-page batches.
-
-    Sends EVERY text line of each page (compactly encoded, never truncated) so the
-    returned table_bbox reaches the real bottom of the table. An 11-page DBS statement
-    costs ~17.7k tokens total, comfortably inside gpt-4o's 30k TPM bucket.
-    """
-    all_page_results: list[dict] = []
-    detail = "auto" if len(images) <= _STAGE1_AUTODETAIL_MAX_PAGES else "low"
-
-    for batch_start in range(0, len(images), _STAGE1_BATCH_SIZE):
-        batch_images = images[batch_start : batch_start + _STAGE1_BATCH_SIZE]
-        batch_lines = all_text_lines[batch_start : batch_start + _STAGE1_BATCH_SIZE]
-
-        user_content: list[dict] = []
-        for i, (img, lines) in enumerate(zip(batch_images, batch_lines), start=batch_start + 1):
-            user_content.append({
-                "type": "text",
-                "text": f"=== Page {i} native text lines ===\n{json.dumps(_slim_lines_for_stage1(lines), separators=(',', ':'))}",
-            })
-            user_content.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{img}", "detail": detail},
-            })
-        user_content.append({
-            "type": "text",
-            "text": "For each page, identify whether it contains a transaction table and the semantic role of each column.",
-        })
-
-        response = client.chat.completions.create(
-            model=_STAGE1_MODEL,
-            messages=[
-                {"role": "system", "content": _LAYOUT_SYSTEM_PROMPT},
-                {"role": "user", "content": user_content},
-            ],
-            temperature=0,
-            response_format=_LAYOUT_SCHEMA,
-        )
-        logger.info(
-            "Stage 1 batch pages %d-%d: %d prompt tokens (%s)",
-            batch_start + 1, batch_start + len(batch_images),
-            response.usage.prompt_tokens if response.usage else -1, _STAGE1_MODEL,
-        )
-        batch_result = json.loads(response.choices[0].message.content.strip())
-        all_page_results.extend(batch_result.get("pages", []))
-
-    return {"pages": all_page_results}
-
-
-# ── Stage 2: Deterministic PyMuPDF extraction ─────────────────────────────────
-
-def _match_header_line(header_text: str, text_lines: list[dict]) -> dict | None:
-    """Find the text line that best matches a column header string.
-
-    Collects all candidates (exact, first-word, substring), then returns the one
-    closest to the top of the page. This ensures column headers at the top of the
-    table are preferred over any body or footer text that happens to contain the
-    same word (e.g. "Balance Brought Forward" matching a "Balance" column lookup).
-    """
-    def normalise(s: str) -> str:
-        return _re.sub(r"[^a-z0-9 ]", "", s.lower()).strip()
-
-    target = normalise(header_text)
-    target_first = target.split()[0] if target else ""
-
-    candidates: list[tuple[int, dict]] = []
-    for line in text_lines:
-        norm = normalise(line["text"])
-        if norm == target:
-            candidates.append((0, line))
-        elif target_first and norm == target_first:
-            candidates.append((1, line))
-        elif target and (target in norm or norm in target):
-            candidates.append((2, line))
-
-    if not candidates:
-        return None
-
-    # Sort by match quality first (0=exact, 1=first-word, 2=substring), then by
-    # y-center ascending within the same quality tier. This ensures an exact-match
-    # column header is always preferred over a higher-on-page substring hit such as
-    # "Total Deposits" matching a "Deposit (+)" lookup.
-    candidates.sort(key=lambda c: (c[0], (c[1]["y0"] + c[1]["y1"]) / 2))
-    return candidates[0][1]
-
-
-def _find_column_boundaries(
-    columns: list[dict], text_lines: list[dict], page_width: float,
-    table_y_start: float | None = None,
-    table_x_start: float | None = None,
-) -> list[dict]:
-    """Derive x-boundaries for each semantic column from matched header positions.
-
-    table_y_start: Vision's table bbox y0 in PDF points — restricts header search to
-        a narrow band near the actual column header row, preventing headers from a
-        second account section on the same page (or account-summary lines) from being
-        picked up instead of the intended column header row.
-    table_x_start: Vision's table bbox x0 in PDF points — becomes the left boundary
-        of the leftmost column, dropping words in the page's left margin (e.g. rotated
-        DBS registration stamps) that would otherwise land in the date column.
-
-    Returns list of dicts sorted left-to-right:
-      {"field": str, "header_text": str, "x_start": float, "x_end": float,
-       "header_y_bottom": float}
-    Only includes columns whose header was found in the native text.
-    """
-    # Narrow the search to text lines near the expected header row, if we know where it is.
-    # A ±5 pt lower margin and +50 pt upper margin handles minor Vision imprecision and
-    # multi-row column headers while excluding content from other table sections.
-    if table_y_start is not None:
-        search_lines = [
-            l for l in text_lines
-            if l["y0"] >= table_y_start - 5 and l["y0"] <= table_y_start + 50
-        ]
-    else:
-        search_lines = text_lines
-
-    located = []
-    for col in columns:
-        if col["field"] == "other":
-            continue
-        match = _match_header_line(col["header_text"], search_lines)
-        if match:
-            x_center = (match["x0"] + match["x1"]) / 2
-            located.append({
-                "field": col["field"],
-                "header_text": col["header_text"],
-                "x_center": x_center,
-                "header_y_bottom": match["y1"],
-            })
-
-    if not located:
-        return []
-
-    located.sort(key=lambda c: c["x_center"])
-
-    # Midpoint boundaries. The leftmost boundary is set to table_x_start (if provided)
-    # so that words in the page's left margin — outside the table's physical left edge —
-    # fall outside all column ranges and are silently ignored.
-    left_boundary = table_x_start if table_x_start is not None else 0.0
-    boundaries = [left_boundary]
-    for i in range(len(located) - 1):
-        boundaries.append((located[i]["x_center"] + located[i + 1]["x_center"]) / 2)
-    boundaries.append(page_width)
-
-    result = []
-    for i, col in enumerate(located):
-        result.append({
-            "field": col["field"],
-            "header_text": col["header_text"],
-            "x_start": boundaries[i],
-            "x_end": boundaries[i + 1],
-            "header_y_bottom": col["header_y_bottom"],
-        })
-    return result
-
-
-def _extract_rows_from_page(
-    page, col_defs: list[dict], table_y_end: float | None = None, y_tol: float = 8.0
-) -> list[dict]:
-    """Extract transaction rows from one page using column boundary definitions.
-
-    Words below the header row (and above table_y_end if provided) are grouped
-    into visual rows by y-proximity, then each word is assigned to the column
-    containing its x-centre.
-    """
-    if not col_defs:
-        return []
-
-    table_y_start = max(c["header_y_bottom"] for c in col_defs)
-    words = page.get_text("words", sort=True)
-    below = [w for w in words if w[1] > table_y_start]
-
-    if not below:
-        return []
-
-    # Adaptive y_tol from balance-column monetary values only.
-    # One value per row → gaps equal row spacing (no multi-word description noise).
-    row_spacing = _compute_row_spacing(below, col_defs)
-    if row_spacing > 0:
-        y_tol = min(max(row_spacing * 0.8, 4.0), 10.0)
-
-    # Hard cutoff: when Vision's table_bbox accurately marks the end of a short table
-    # (top 35% of the page), exclude words whose bottom edge is below that bound.
-    # For full-page tables Vision undershoots table_y_end (~40% of actual height),
-    # so the filter is skipped to avoid truncating real transactions.
-    # This cutoff is the most destructive step in the pipeline: a bbox that is too short
-    # (as happens when Stage 1 is fed truncated text lines) silently deletes most of the
-    # page. Log whenever it fires so that shows up in the logs instead of as missing rows.
-    page_height = page.rect.height
-    if table_y_end is not None and page_height > 0 and table_y_end / page_height < 0.35:
-        kept = [w for w in below if w[3] < table_y_end]
-        logger.info(
-            "Partial-table cutoff at y=%.1f on %.0fpt page: kept %d of %d words",
-            table_y_end, page_height, len(kept), len(below),
-        )
-        below = kept
-        if not below:
-            return []
-
-    money_fields = {"debit", "credit", "balance"}
-
-    # Group into visual rows by y-center proximity with a money-column collision guard.
-    # If a new word would land in a money column that's already occupied in the current
-    # visual row, start a new row regardless of y-distance — two transactions can never
-    # share the same money column.
-    visual_rows: list[dict] = []
-    for w in below:
-        x0, y0, x1, y1, text = w[0], w[1], w[2], w[3], w[4]
-        y_center = (y0 + y1) / 2
-        x_center = (x0 + x1) / 2
-
-        if visual_rows and abs(y_center - visual_rows[-1]["y"]) <= y_tol:
-            new_field = next(
-                (c["field"] for c in col_defs if c["x_start"] <= x_center < c["x_end"]),
-                None,
-            )
-            if new_field in money_fields:
-                occupied = {
-                    next(
-                        (c["field"] for c in col_defs if c["x_start"] <= xc < c["x_end"]),
-                        None,
-                    )
-                    for xc, _ in visual_rows[-1]["words"]
-                }
-                if new_field in occupied:
-                    visual_rows.append({"y": y_center, "words": [(x_center, text)]})
-                    continue
-            visual_rows[-1]["words"].append((x_center, text))
-        else:
-            visual_rows.append({"y": y_center, "words": [(x_center, text)]})
-
-    date_col_exists = any(c["field"] == "date" for c in col_defs)
-    rows: list[dict] = []
-
-    for vrow in visual_rows:
-        row: dict[str, list[str]] = {c["field"]: [] for c in col_defs}
-        for x_center, text in vrow["words"]:
-            for col in col_defs:
-                if col["x_start"] <= x_center < col["x_end"]:
-                    row[col["field"]].append(text)
-                    break
-
-        row_dict = {field: " ".join(texts).strip() for field, texts in row.items()}
-
-        # Strip noise from date column (e.g. "No. 23/05/2026" → "23/05/2026")
-        if date_col_exists and row_dict.get("date"):
-            row_dict["date"] = _clean_date_field(row_dict["date"])
-
-        has_debit   = _is_money_value(row_dict.get("debit", ""))
-        has_credit  = _is_money_value(row_dict.get("credit", ""))
-        has_balance = _is_money_value(row_dict.get("balance", ""))
-        has_money   = has_debit or has_credit or has_balance
-        has_date    = date_col_exists and _has_date_value(row_dict.get("date", ""))
-
-        desc_lower = row_dict.get("description", "").strip().lower()
-
-        # Description-first filter: drop any known non-transaction summary row regardless
-        # of whether it has monetary values (catches "Total Balance Carried Forward" which
-        # has debit+credit+balance totals and would otherwise become a fake anchor row).
-        if desc_lower and any(kw in desc_lower for kw in _NON_TXN_DESCS):
-            continue
-
-        # Drop pure balance-marker rows with no debit/credit/date and no description.
-        if has_balance and not has_debit and not has_credit and not has_date:
-            if not desc_lower:
-                continue
-
-        if has_money or has_date:
-            rows.append(row_dict)
-        elif rows:
-            # Continuation line: fold all non-empty cell text (in column order)
-            # into the preceding anchor's description.
-            # Money columns (debit/credit/balance) only contribute if their value
-            # looks like an actual monetary amount — non-money text landing there
-            # (e.g. "Page" from a footer that collides with the balance column) is
-            # noise and must not bleed into the description.
-            continuation = " ".join(
-                row_dict[c["field"]] for c in col_defs
-                if row_dict.get(c["field"]) and (
-                    c["field"] not in {"debit", "credit", "balance"}
-                    or _is_money_value(row_dict[c["field"]])
-                )
-            )
-            if continuation and not _FOOTER_RE.search(continuation):
-                rows[-1]["description"] = (
-                    rows[-1].get("description", "") + " " + continuation
-                ).strip()
-        # else: pre-table header/footer lines — drop
-
-    return rows
-
-
-def _rows_to_csv(all_rows: list[dict], field_names: list[str]) -> str:
-    output = _io.StringIO()
-    writer = _csv.DictWriter(output, fieldnames=field_names, extrasaction="ignore")
-    writer.writeheader()
-    writer.writerows(all_rows)
-    return output.getvalue()
-
-
-# ── Stage 3: GPT text parse ───────────────────────────────────────────────────
-
-def _parse_csv_with_gpt(table_csv: str, bank_source: str) -> dict:
-    """Send a labelled CSV to gpt-4o-mini for structured transaction extraction."""
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT_CSV},
-            {"role": "user", "content": f"Bank: {bank_source}\n\n{table_csv}"},
-        ],
-        temperature=0,
-        response_format=_RESPONSE_SCHEMA,
-    )
-    logger.info(
-        "Stage 3: %d prompt + %d completion tokens (gpt-4o-mini)",
-        response.usage.prompt_tokens if response.usage else -1,
-        response.usage.completion_tokens if response.usage else -1,
-    )
-    data = json.loads(response.choices[0].message.content.strip())
-    return _extract_parsed_result(data)
-
-
-# ── Vision fallback ───────────────────────────────────────────────────────────
-
-def _parse_statement_vision_fallback(pdf_path: str, bank_source: str) -> dict:
-    """Fallback: send all pages as images to gpt-4o to extract transactions directly."""
-    images = pdf_to_base64_images(pdf_path)
-    user_content = [
-        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img}", "detail": "high"}}
-        for img in images
-    ]
-    user_content.append({
-        "type": "text",
-        "text": f"Bank: {bank_source}\n\nExtract ALL transactions from ALL pages of this bank statement.",
-    })
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-        temperature=0,
-        response_format=_RESPONSE_SCHEMA,
-    )
-    data = json.loads(response.choices[0].message.content.strip())
-    return _extract_parsed_result(data)
-
-
-# ── Main entry point ──────────────────────────────────────────────────────────
-
 def parse_statement(pdf_path: str, bank_source: str) -> dict:
-    """Parse a bank statement PDF using a three-stage pipeline.
+    """Extract all transactions from a bank statement PDF in a single model call.
 
-    Stage 1 (Vision): detect which pages have transaction tables and identify
-                      column semantics (debit/credit/date/description/balance).
-    Stage 2 (PyMuPDF): deterministically extract rows using native text
-                       coordinates and the column boundaries from Stage 1.
-    Stage 3 (gpt-4o-mini): clean and normalise the structured CSV into the
-                            standard transaction JSON schema.
+    Returns {"transactions": list[dict], "closing_balance": float|None,
+             "account_type": str|None}, where each transaction carries
+    date, transaction_date, description, amount, type, account_type,
+    is_transfer and reference_id.
 
-    Falls back to full Vision extraction if Stage 1 finds no tabular pages.
+    Raises on a truncated, empty, or malformed response — never returns partial data.
     """
-    doc = fitz.open(pdf_path)
-    pages = list(doc)
+    pdf_file = Path(pdf_path)
+    with open(pdf_file, "rb") as f:
+        b64_pdf = base64.b64encode(f.read()).decode()
 
-    # Render images and extract text lines for all pages
-    mat = fitz.Matrix(150 / 72, 150 / 72)
-    images = []
-    all_text_lines = []
-    for page_num, page in enumerate(pages, start=1):
-        pix = page.get_pixmap(matrix=mat)
-        images.append(base64.b64encode(pix.tobytes("png")).decode())
-        all_text_lines.append(_get_page_text_lines(page, page_num))
+    logger.info(
+        "Parsing %s (%s, %.1f MB) with %s (effort=%s)",
+        pdf_file.name, bank_source, pdf_file.stat().st_size / 1_048_576,
+        _PARSER_MODEL, _REASONING_EFFORT,
+    )
 
-    doc_for_extract = fitz.open(pdf_path)  # second open for extraction (pages already closed above)
-    doc.close()
+    response = _client().responses.create(
+        model=_PARSER_MODEL,
+        reasoning={"effort": _REASONING_EFFORT},
+        service_tier=_SERVICE_TIER,
+        max_output_tokens=_MAX_OUTPUT_TOKENS,
+        text={
+            "format": {
+                # Responses API uses a flat shape here — `name` sits at the top
+                # level, not nested under a "json_schema" key as in Chat Completions.
+                "type": "json_schema",
+                "name": "bank_statement",
+                "strict": True,
+                "schema": _TRANSACTION_SCHEMA,
+            }
+        },
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": _EXTRACTION_PROMPT.format(bank=bank_source)},
+                    {
+                        "type": "input_file",
+                        "filename": pdf_file.name,
+                        "file_data": f"data:application/pdf;base64,{b64_pdf}",
+                    },
+                ],
+            }
+        ],
+    )
 
-    # Stage 1: Vision layout detection
-    layout = _detect_layout(images, all_text_lines)
-
-    all_rows: list[dict] = []
-    field_names: list[str] = []
-
-    for page_info in layout.get("pages", []):
-        if not page_info.get("has_transaction_table"):
-            continue
-
-        page_num = page_info["page_number"]  # 1-indexed
-        columns = page_info.get("columns", [])
-        if not columns:
-            continue
-
-        page = doc_for_extract[page_num - 1]
-        text_lines = all_text_lines[page_num - 1]
-        page_width = page.rect.width
-
-        # Stage 2: derive boundaries and extract rows.
-        # Vision returns table_bbox in native PDF-point coordinates (same system as
-        # the text_lines from PyMuPDF). The y0/x0 values are passed unscaled so
-        # _find_column_boundaries can restrict its header search to the correct
-        # table section and set the correct left-margin boundary.
-        # The y1 (table bottom) is scaled by 72/150 to convert from the pixel-space
-        # Vision was trained on — this gives a tighter cutoff that reliably excludes
-        # footers and secondary account sections that appear below the transactions.
-        _PDF_SCALE = 72.0 / 150.0
-        bbox = page_info.get("table_bbox")
-        col_defs = _find_column_boundaries(
-            columns, text_lines, page_width,
-            table_y_start=bbox[1] if bbox else None,
-            table_x_start=bbox[0] if bbox else None,
+    usage = getattr(response, "usage", None)
+    if usage:
+        reasoning = getattr(getattr(usage, "output_tokens_details", None), "reasoning_tokens", 0)
+        logger.info(
+            "Parsed %s: %s input + %s output tokens (%s reasoning)",
+            pdf_file.name, usage.input_tokens, usage.output_tokens, reasoning,
         )
-        if not col_defs:
-            continue
 
-        table_y_end = bbox[3] * _PDF_SCALE if bbox else None
+    _assert_complete(response)
 
-        rows = _extract_rows_from_page(page, col_defs, table_y_end=table_y_end)
-        if rows:
-            all_rows.extend(rows)
-            if not field_names:
-                field_names = [c["field"] for c in col_defs]
+    try:
+        data = json.loads(response.output_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Model returned invalid JSON: {exc}") from exc
 
-    doc_for_extract.close()
-
-    if all_rows and field_names:
-        # Embed pre-computed type/amount from Stage 2 column positions directly
-        # into the CSV. Each row carries its own _type/_amount so Stage 3 never
-        # needs to infer them — no positional alignment, no GPT guessing.
-        for row in all_rows:
-            dv = row.get("debit", "")
-            cv = row.get("credit", "")
-            if _is_money_value(dv):
-                row["_type"] = "debit"
-                row["_amount"] = dv
-            elif _is_money_value(cv):
-                row["_type"] = "credit"
-                row["_amount"] = cv
-            else:
-                row["_type"] = ""
-                row["_amount"] = ""
-
-        table_csv = _rows_to_csv(all_rows, field_names + ["_type", "_amount"])
-        return _parse_csv_with_gpt(table_csv, bank_source)
-
-    # Fallback: no tabular pages found → Vision extraction
-    return _parse_statement_vision_fallback(pdf_path, bank_source)
-
-
-# Backward-compat alias
-parse_statement_with_vision = parse_statement
+    result = _extract_parsed_result(data)
+    logger.info("Extracted %d transactions from %s", len(result["transactions"]), pdf_file.name)
+    return result
 
 
 # ── Utility functions (unchanged) ─────────────────────────────────────────────

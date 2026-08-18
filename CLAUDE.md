@@ -42,7 +42,7 @@ All UI must follow the dark dashboard design system. Key tokens:
 | Backend | FastAPI (Python) | Lightweight, async, scales to auth + API layer |
 | Database | SQLite locally → PostgreSQL on Render | Zero setup locally, managed Postgres in prod |
 | Migrations | Alembic | Clean schema versioning |
-| PDF Parsing | pdfplumber + OpenAI API | pdfplumber extracts raw text; GPT-4o mini structures it |
+| PDF Parsing | OpenAI Responses API (reasoning model, native PDF input) | One call per statement; no layout/coordinate logic |
 | AI Categorization | OpenAI API (GPT-4o mini) | Cheap, accurate |
 | Stock Prices | yfinance (free, no API key) | Real-time/delayed quotes for stocks, ETFs, FX |
 | Frontend | Jinja2 + Vanilla JS + Chart.js | No build tooling needed |
@@ -63,7 +63,9 @@ All UI must follow the dark dashboard design system. Key tokens:
 - MariBank
 - And any future banks
 
-**Parsing approach:** pdfplumber → raw text → GPT-4o mini → structured JSON. No hardcoded regex. Raw text stored in DB so old statements can be re-parsed if prompt improves. **PDFs are deleted after successful parse** (raw_text is sufficient).
+**Parsing approach:** the PDF is sent natively to a reasoning model in a single Responses API call, which returns structured JSON validated against a strict schema. No hardcoded regex, no layout detection. **PDFs are deleted after a successful parse.**
+
+> Note: `statement_uploads.raw_text` is a legacy column that is never written — the "Extract Balance" button in `upload.html` is gated on it and posts to a route that does not exist. Both are dead and pending cleanup.
 
 ---
 
@@ -139,9 +141,8 @@ id, user_id (FK → users), ticker, trade_type (BUY/SELL), quantity, price, date
 ```
 PDF Upload
     ↓
-pdfplumber → extract raw text
-    ↓
-GPT-4o mini → structured JSON: [{ date, description, reference_id, amount, type, account_type, is_transfer }]
+parse_statement() → ONE call: PDF sent natively to a reasoning model (Responses API,
+                    input_file + strict json_schema) → structured JSON
     ↓
 Deduplicator → compute hash (includes reference_id), check (hash, user_id) unique, skip if exists
     ↓
@@ -154,11 +155,44 @@ Categorizer → transfers by rule; rest batch-sent to GPT with few-shot examples
 is_reviewed=True → visible in dashboard analytics
 ```
 
-### GPT extraction — key prompt rules (`app/services/pdf_parser.py` SYSTEM_PROMPT)
-- Extract EVERY row — never skip
-- `description`: preserve type prefix (e.g. "Cash Withdrawal", "Salary"); strip card numbers (16-digit patterns); do NOT strip reference numbers — those go in `reference_id`
-- `reference_id`: raw transaction reference number if visible; null otherwise
-- `is_transfer`: true for wallet top-ups, inter-account transfers, credit card bill payments, own-account PayNow/FAST
+The model reads the PDF directly — there is no rendering, no text extraction, and no
+coordinate/layout logic. This replaced a 3-stage pipeline (Vision layout detection →
+PyMuPDF row extraction → GPT CSV structuring) whose geometry heuristics silently dropped
+transactions. `pymupdf` is no longer a dependency.
+
+### Contract — violating these silently drops rows in `app/routers/upload.py`
+- `amount` must be **positive**; `if amount <= 0: continue` discards the row with no error.
+  Direction lives in `type` (`"debit"`/`"credit"`), never in the sign.
+- `date` must parse via `parse_date()` (emit ISO `YYYY-MM-DD`) or the row is dropped.
+- `reference_id` feeds the dedup hash — it is the only thing separating two same-merchant,
+  same-day, same-amount transactions.
+
+### Key prompt rules (`_EXTRACTION_PROMPT` in `app/services/pdf_parser.py`)
+- Extract EVERY row — never skip, summarise, or truncate
+- **`type` comes from WHICH COLUMN the amount is in (or the CR/DR marker), never from the
+  description wording.** A "Debit Card Transaction" row is often a refund in the Deposit
+  column and must then be `credit`. Without this rule the model misclassifies refunds.
+- CR/DR statements (PayLah!): the marker sets `type` and is stripped from `amount`
+- `description`: preserve the type prefix and merchant name, but EXCLUDE anything that varies
+  per transaction — the reference number, trailing date codes ("27APR"), card numbers, footers.
+  It must be identical across visits to the same merchant, because
+  `categorization_examples.description` is the key the categorizer learns on.
+- `reference_id`: transaction reference/trace number if visible; null otherwise
+- `is_transfer`: true for wallet top-ups, inter-account transfers, credit card bill payments
+
+### Failure handling
+`_assert_complete()` raises on an `incomplete` response (e.g. `max_output_tokens` hit) or empty
+output, so a truncated extraction surfaces as a failed upload rather than a plausible-looking
+partial result. Never soften this into a warning.
+
+### Verifying prompt/model changes
+Offline tests cannot catch extraction regressions. After any change to the prompt, schema or
+model, run the live suite against the known-good statement:
+```
+RUN_LIVE_PARSER_TESTS=1 venv/Scripts/python -m pytest tests/test_pdf_pipeline.py -v
+```
+Ground truth for `may26_dbs.pdf`: **93 transactions, debits 5919.87, credits 3378.36,
+closing balance 947.19** (manually counted from the PDF).
 
 ---
 
@@ -259,6 +293,7 @@ OPENAI_API_KEY, DATABASE_URL, SECRET_KEY, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
 - Only `is_reviewed=True` transactions appear in dashboard analytics
 - Amount values may be negative (legacy data); always use `abs()` / `|abs` filter when displaying — `type` field carries sign semantics
 - **Zombie server warning:** check for zombie uvicorn processes with `netstat -ano | findstr :8000`; kill with `Stop-Process -Id <pid> -Force`
-- `parse_statement_with_gpt` returns `dict`: `{"transactions": list, "closing_balance": float|None, "account_type": str|None}`. Old alias `parse_transactions_with_gpt` → list kept for backward compat.
+- `parse_statement(pdf_path, bank_source)` returns `dict`: `{"transactions": list, "closing_balance": float|None, "account_type": str|None}`. It is called from exactly one place — `app/routers/upload.py` Phase A — so the pipeline can be swapped without touching anything downstream.
+- Parser model/effort are env-overridable: `STATEMENT_PARSER_MODEL` (default `gpt-5.6-terra`), `STATEMENT_PARSER_EFFORT` (`high`), `STATEMENT_PARSER_SERVICE_TIER` (`default`). A statement takes ~90s to parse; the request timeout is 600s and `_PROCESSING_TIMEOUT` in `upload.py` is 15 min.
 - `batch_alter_table` in Alembic is SQLite-specific — new migrations targeting Postgres should use regular `op.add_column` etc. or check dialect
 - `DATABASE_URL` from Render starts with `postgres://` — must replace with `postgresql://` for SQLAlchemy

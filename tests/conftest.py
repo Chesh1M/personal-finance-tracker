@@ -1,5 +1,15 @@
 import os
 
+# Load .env first so the opt-in live parser tests (RUN_LIVE_PARSER_TESTS=1) get the
+# real OPENAI_API_KEY. Without this the setdefault below wins and they fail to auth.
+# CI has no .env, so it falls through to the dummies as before.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+
 # Set dummy env vars before any app modules are imported so module-level
 # clients (OpenAI, etc.) don't raise "missing credentials" errors in tests.
 os.environ.setdefault("OPENAI_API_KEY", "test-key-not-used-in-tests")

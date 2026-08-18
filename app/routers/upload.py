@@ -8,7 +8,10 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_PROCESSING_TIMEOUT = timedelta(minutes=10)
+# Must exceed the parser's 600s request timeout plus categorisation, or this lazy
+# expiry marks a still-running parse as failed. High-effort reasoning over a full
+# statement runs for minutes.
+_PROCESSING_TIMEOUT = timedelta(minutes=15)
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse, RedirectResponse

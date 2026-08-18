@@ -1,31 +1,32 @@
-"""Regression tests for the Stage 2 PDF extraction pipeline.
+"""End-to-end accuracy tests for the PDF extraction pipeline.
 
-Uses a frozen Stage 1 layout fixture (tests/fixtures/may26_dbs_layout.json) so
-no OpenAI API calls are made during testing.  Tests run only when may26_dbs.pdf
-is present in the project root (it is gitignored).
+These call the real model, so they cost money and take minutes. They are opt-in:
 
-To regenerate the fixture after intentional pipeline changes:
-    venv\\Scripts\\python tests/generate_layout_fixture.py
+    RUN_LIVE_PARSER_TESTS=1 venv/Scripts/python -m pytest tests/test_pdf_pipeline.py -v
 
-Ground truth for may26_dbs.pdf (May 2026 DBS statement, 11 pages):
-  - 93 transaction rows extracted by Stage 2
-  - Total withdrawals: 5919.87
-  - Total deposits:    3378.36
+Run them after any change to the extraction prompt, the schema, or the model —
+those changes cannot be validated by the offline suite.
+
+Ground truth for may26_dbs.pdf (May 2026 DBS statement, 11 pages), manually
+counted from the PDF by the user:
+  - 93 transactions
+  - Total debits:    5919.87
+  - Total credits:   3378.36
+  - Closing balance:  947.19
 """
 
-import json
+import os
 from pathlib import Path
 
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-PDF_PATH = ROOT / "may26_dbs.pdf"
-FIXTURE_PATH = ROOT / "tests" / "fixtures" / "may26_dbs_layout.json"
+DBS_PDF = ROOT / "may26_dbs.pdf"
+PAYLAH_PDF = ROOT / "may26_paylah.pdf"
 
-# Skip the whole module if the PDF is absent (CI environment)
 pytestmark = pytest.mark.skipif(
-    not PDF_PATH.exists(),
-    reason="may26_dbs.pdf not present — PDF pipeline tests run locally only",
+    os.environ.get("RUN_LIVE_PARSER_TESTS") != "1",
+    reason="Live parser tests are opt-in: set RUN_LIVE_PARSER_TESTS=1",
 )
 
 _FOOTER_MARKERS = [
@@ -37,218 +38,115 @@ _FOOTER_MARKERS = [
 
 
 @pytest.fixture(scope="module")
-def stage2_rows():
-    """Run Stage 2 (deterministic PyMuPDF extraction) using the frozen Stage 1 fixture.
+def dbs_result():
+    """Parse may26_dbs.pdf once and share the result across tests (one API call)."""
+    if not DBS_PDF.exists():
+        pytest.skip("may26_dbs.pdf not present")
+    from app.services.pdf_parser import parse_statement
 
-    Returns (all_rows, field_names) where all_rows is the list of raw row dicts
-    before Stage 3 GPT normalisation — each row has 'date', 'description',
-    'debit', 'credit', 'balance', '_type', '_amount' keys.
-    """
-    if not FIXTURE_PATH.exists():
-        pytest.skip(
-            f"Layout fixture not found at {FIXTURE_PATH}. "
-            "Run: venv\\Scripts\\python tests/generate_layout_fixture.py"
-        )
-
-    import fitz
-    from app.services.pdf_parser import (
-        _extract_rows_from_page,
-        _find_column_boundaries,
-        _get_page_text_lines,
-        _is_money_value,
-    )
-
-    layout = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
-    doc = fitz.open(str(PDF_PATH))
-    all_text_lines = [_get_page_text_lines(doc[i], i + 1) for i in range(len(doc))]
-
-    all_rows: list[dict] = []
-    field_names: list[str] = []
-
-    _PDF_SCALE = 72.0 / 150.0
-
-    for page_info in layout.get("pages", []):
-        if not page_info.get("has_transaction_table"):
-            continue
-        page_num = page_info["page_number"]
-        columns = page_info.get("columns", [])
-        if not columns:
-            continue
-
-        page = doc[page_num - 1]
-        text_lines = all_text_lines[page_num - 1]
-        page_width = page.rect.width
-
-        bbox = page_info.get("table_bbox")
-        col_defs = _find_column_boundaries(
-            columns, text_lines, page_width,
-            table_y_start=bbox[1] if bbox else None,
-            table_x_start=bbox[0] if bbox else None,
-        )
-        if not col_defs:
-            continue
-
-        table_y_end = bbox[3] * _PDF_SCALE if bbox else None
-
-        rows = _extract_rows_from_page(page, col_defs, table_y_end=table_y_end)
-        if rows:
-            # Mirror what parse_statement does: embed _type and _amount
-            for row in rows:
-                dv = row.get("debit", "")
-                cv = row.get("credit", "")
-                if _is_money_value(dv):
-                    row["_type"] = "debit"
-                    row["_amount"] = dv
-                elif _is_money_value(cv):
-                    row["_type"] = "credit"
-                    row["_amount"] = cv
-                else:
-                    row["_type"] = ""
-                    row["_amount"] = ""
-            all_rows.extend(rows)
-            if not field_names:
-                field_names = [c["field"] for c in col_defs]
-
-    doc.close()
-    return all_rows, field_names
+    return parse_statement(str(DBS_PDF), "DBS")
 
 
-# ── Row count ─────────────────────────────────────────────────────────────────
+@pytest.fixture(scope="module")
+def paylah_result():
+    if not PAYLAH_PDF.exists():
+        pytest.skip("may26_paylah.pdf not present")
+    from app.services.pdf_parser import parse_statement
 
-def test_row_count(stage2_rows):
-    rows, _ = stage2_rows
-    assert len(rows) == 93, (
-        f"Expected 93 rows, got {len(rows)}.\n"
-        f"Row descriptions: {[r.get('description','') for r in rows]}"
-    )
-
-
-# ── Financial totals ──────────────────────────────────────────────────────────
-
-def test_total_withdrawals(stage2_rows):
-    from app.services.pdf_parser import _is_money_value
-    rows, _ = stage2_rows
-    total = sum(
-        float(r["debit"].replace(",", ""))
-        for r in rows
-        if _is_money_value(r.get("debit", ""))
-    )
-    assert abs(total - 5919.87) < 0.01, (
-        f"Expected total withdrawals 5919.87, got {total:.2f}"
-    )
+    return parse_statement(str(PAYLAH_PDF), "DBS PayLah!")
 
 
-def test_total_deposits(stage2_rows):
-    from app.services.pdf_parser import _is_money_value
-    rows, _ = stage2_rows
-    total = sum(
-        float(r["credit"].replace(",", ""))
-        for r in rows
-        if _is_money_value(r.get("credit", ""))
-    )
-    assert abs(total - 3378.36) < 0.01, (
-        f"Expected total deposits 3378.36, got {total:.2f}"
-    )
+# ── Ground truth: may26_dbs.pdf ───────────────────────────────────────────────
+
+def test_transaction_count(dbs_result):
+    txs = dbs_result["transactions"]
+    assert len(txs) == 93, f"Expected 93 transactions, got {len(txs)}"
+
+
+def test_total_debits(dbs_result):
+    total = sum(t["amount"] for t in dbs_result["transactions"] if t["type"] == "debit")
+    assert abs(total - 5919.87) < 0.01, f"Expected debits 5919.87, got {total:.2f}"
+
+
+def test_total_credits(dbs_result):
+    total = sum(t["amount"] for t in dbs_result["transactions"] if t["type"] == "credit")
+    assert abs(total - 3378.36) < 0.01, f"Expected credits 3378.36, got {total:.2f}"
+
+
+def test_closing_balance(dbs_result):
+    assert abs((dbs_result["closing_balance"] or 0) - 947.19) < 0.01
+
+
+# ── Contract guards: violating these makes upload.py silently drop rows ───────
+
+def test_all_amounts_positive(dbs_result):
+    """upload.py drops any transaction with amount <= 0 without an error."""
+    bad = [t for t in dbs_result["transactions"] if t["amount"] <= 0]
+    assert not bad, f"{len(bad)} transaction(s) have a non-positive amount: {bad[:3]}"
+
+
+def test_all_dates_parseable(dbs_result):
+    """upload.py drops any transaction whose date parse_date() rejects."""
+    from app.services.pdf_parser import parse_date
+
+    bad = []
+    for t in dbs_result["transactions"]:
+        try:
+            parse_date(str(t["date"]))
+        except ValueError:
+            bad.append(t)
+    assert not bad, f"{len(bad)} transaction(s) have an unparseable date: {bad[:3]}"
+
+
+def test_all_types_valid(dbs_result):
+    bad = [t for t in dbs_result["transactions"] if t["type"] not in ("debit", "credit")]
+    assert not bad, f"Invalid type values: {bad[:3]}"
+
+
+def test_account_type_is_valid(dbs_result):
+    valid = {"savings", "current", "credit_card", "paylah", "other"}
+    assert dbs_result["account_type"] in valid
 
 
 # ── Description quality ───────────────────────────────────────────────────────
 
-def test_no_footer_text_in_descriptions(stage2_rows):
-    rows, _ = stage2_rows
-    violations = []
-    for r in rows:
-        desc = r.get("description", "")
-        for marker in _FOOTER_MARKERS:
-            if marker in desc:
-                violations.append(f"Marker {marker!r} found in: {desc!r}")
-    assert not violations, (
-        f"{len(violations)} footer violation(s):\n" + "\n".join(violations)
-    )
-
-
-def test_interest_earned_no_noise(stage2_rows):
-    """Interest Earned row must be a credit with no '4' digit noise appended."""
-    rows, _ = stage2_rows
-    matches = [r for r in rows if "interest earned" in r.get("description", "").lower()]
-    assert matches, "Interest Earned row not found"
-    for r in matches:
-        desc = r.get("description", "")
-        assert r.get("_type") == "credit", f"Interest Earned should be credit, got: {r}"
-        # The DBS separator glyphs render as "4" characters — ensure none are in the desc
-        noise = [tok for tok in desc.split() if tok == "4"]
-        assert not noise, f"Digit noise '4' found in Interest Earned description: {desc!r}"
-
-
-# ── Specific transaction integrity ────────────────────────────────────────────
-
-def test_paylah_topup_03_may(stage2_rows):
-    """Funds Transfer TOP-UP TO PAYLAH on 03/05/2026 must be a 6.50 withdrawal."""
-    rows, _ = stage2_rows
-    matches = [
-        r for r in rows
-        if "03/05" in r.get("date", "")
-        and "PAYLAH" in r.get("description", "").upper()
-        and r.get("_type") == "debit"
-    ]
-    assert matches, (
-        "PayLah top-up (03/05, debit, 'PAYLAH' in description) not found.\n"
-        f"Rows on 03/05: {[r for r in rows if '03/05' in r.get('date', '')]}"
-    )
-    for r in matches:
-        amount = float(r["_amount"].replace(",", ""))
-        assert abs(amount - 6.50) < 0.01, (
-            f"Expected PayLah top-up amount 6.50, got {amount} in row: {r}"
-        )
-
-
-def test_funds_transfer_chin_se_seong_no_footer(stage2_rows):
-    """Funds transfer to CHIN SE SEONG must not contain footer text."""
-    rows, _ = stage2_rows
-    matches = [
-        r for r in rows
-        if "CHIN SE SEONG" in r.get("description", "").upper()
-        or "FT260503MB46959841" in r.get("description", "")
-    ]
-    assert matches, "Funds transfer to CHIN SE SEONG / FT260503MB46959841 not found"
-    for r in matches:
-        desc = r.get("description", "")
-        for marker in _FOOTER_MARKERS:
-            assert marker not in desc, (
-                f"Footer marker {marker!r} found in funds transfer description: {desc!r}"
-            )
-
-
-# ── Data integrity ────────────────────────────────────────────────────────────
-
-def test_no_dual_money_rows(stage2_rows):
-    """No row should have both a debit AND a credit value — that indicates a summary row
-    (e.g. 'Total Balance Carried Forward') that should have been filtered out."""
-    from app.services.pdf_parser import _is_money_value
-    rows, _ = stage2_rows
+def test_no_footer_text_in_descriptions(dbs_result):
     violations = [
-        r for r in rows
-        if _is_money_value(r.get("debit", "")) and _is_money_value(r.get("credit", ""))
+        t["description"] for t in dbs_result["transactions"]
+        if any(m in t["description"] for m in _FOOTER_MARKERS)
     ]
-    assert not violations, (
-        f"{len(violations)} row(s) have both debit and credit values "
-        f"(summary rows not filtered):\n"
-        + "\n".join(str(r) for r in violations)
-    )
+    assert not violations, f"Footer text leaked into descriptions: {violations[:3]}"
 
 
-def test_type_amount_consistency(stage2_rows):
-    """Every row's _type must match which column (_debit or _credit) has the value."""
-    from app.services.pdf_parser import _is_money_value
-    rows, _ = stage2_rows
-    errors = []
-    for i, r in enumerate(rows):
-        t = r.get("_type", "")
-        has_debit = _is_money_value(r.get("debit", ""))
-        has_credit = _is_money_value(r.get("credit", ""))
-        if t == "debit" and not has_debit:
-            errors.append(f"Row {i}: _type=debit but no debit value: {r}")
-        if t == "credit" and not has_credit:
-            errors.append(f"Row {i}: _type=credit but no credit value: {r}")
-        if t == "" and (has_debit or has_credit):
-            errors.append(f"Row {i}: _type='' but has money value: {r}")
-    assert not errors, "\n".join(errors)
+def test_no_summary_rows(dbs_result):
+    """Balance brought/carried forward lines are not transactions."""
+    banned = ("balance brought forward", "balance b/f", "balance c/f",
+              "total balance carried forward", "total debits", "total credits")
+    violations = [
+        t["description"] for t in dbs_result["transactions"]
+        if any(b in t["description"].lower() for b in banned)
+    ]
+    assert not violations, f"Summary rows extracted as transactions: {violations[:3]}"
+
+
+def test_interest_earned_is_credit(dbs_result):
+    matches = [t for t in dbs_result["transactions"] if "interest earned" in t["description"].lower()]
+    assert matches, "Interest Earned transaction not found"
+    for t in matches:
+        assert t["type"] == "credit", f"Interest Earned should be a credit: {t}"
+
+
+# ── PayLah!: CR/DR notation instead of Withdrawal/Deposit columns ─────────────
+
+def test_paylah_cr_dr_produces_both_types(paylah_result):
+    """PayLah! marks direction with CR/DR rather than separate columns."""
+    types = {t["type"] for t in paylah_result["transactions"]}
+    assert types, "No transactions extracted from the PayLah! statement"
+    assert types <= {"debit", "credit"}, f"Unexpected type values: {types}"
+
+
+def test_paylah_amounts_positive_and_clean(paylah_result):
+    """CR/DR markers must set `type`, never leak into `amount`."""
+    for t in paylah_result["transactions"]:
+        assert t["amount"] > 0, f"Non-positive amount: {t}"
+        assert isinstance(t["amount"], (int, float)), f"Amount is not numeric: {t}"
