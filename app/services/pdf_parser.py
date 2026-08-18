@@ -85,7 +85,9 @@ client = OpenAI(timeout=90.0, max_retries=3)  # 4-page batches complete in <60s;
 
 # ── Stage 1: Vision layout-detection schema ───────────────────────────────────
 _LAYOUT_SYSTEM_PROMPT = """You are a bank statement layout analyser.
-You will receive page images of a bank statement alongside native text lines extracted from each page (as JSON).
+You will receive page images of a bank statement alongside native text lines extracted from each page.
+Each page's text lines are a compact JSON array whose entries are [text, x0, y0, x1, y1],
+where the coordinates are PDF points with the origin at the top-left of the page.
 For each page, determine whether it contains a transaction table.
 If it does, identify the semantic role of each column by matching the column header text exactly as it appears.
 
@@ -337,10 +339,27 @@ def _get_page_text_lines(page, page_num: int) -> list[dict]:
 
 
 _STAGE1_BATCH_SIZE = 4    # pages per Vision call; smaller = faster, more resilient to timeouts
-_STAGE1_MAX_LINES = 50   # text lines per page sent to Stage 1 for column-header location
-# Stage 1 only needs to locate column headers (Date/Description/Withdrawal/…), which always
-# appear in the first 30-50 text lines of each page. The actual transaction extraction is done
-# by Stage 2 (PyMuPDF reading the full PDF) — this limit does NOT affect data completeness.
+
+# NEVER truncate the per-page text lines sent to Stage 1. Stage 1 must return table_bbox
+# spanning down to the LAST transaction row, and it derives that bottom edge from these
+# lines. Truncating them makes the bbox too short, which then trips the partial-table guard
+# in _extract_rows_from_page (table_y_end / page_height < 0.35) and silently discards most
+# of every page — a 50-line cap cut may26_dbs.pdf from 93 rows to 10.
+# Token cost is controlled by _slim_lines_for_stage1 instead, which is lossless per line.
+
+
+def _slim_lines_for_stage1(lines: list[dict]) -> list[list]:
+    """Shrink the Stage 1 text-line payload without dropping any lines.
+
+    Encodes each line as a positional [text, x0, y0, x1, y1] array instead of a dict
+    with an unused 'id' key and fractional coordinates. This is ~65% smaller than the
+    dict form while preserving every line, so the model still sees the true bottom of
+    the table. Measured on may26_dbs.pdf: 29.3k -> 17.7k Stage 1 tokens, still 93 rows.
+    """
+    return [
+        [l["text"], int(l["x0"]), int(l["y0"]), int(l["x1"]), int(l["y1"])]
+        for l in lines
+    ]
 
 # Stage 1 MUST stay on gpt-4o, not gpt-4o-mini. OpenAI bills gpt-4o-mini image input at
 # 33.3x the token count of gpt-4o (base 2833 + 5667/tile vs 85 + 170/tile). An A4 page is
@@ -350,23 +369,24 @@ _STAGE1_MAX_LINES = 50   # text lines per page sent to Stage 1 for column-header
 # the full 200k gpt-4o-mini budget for Stage 3 + categorisation.
 _STAGE1_MODEL = "gpt-4o"
 
-# gpt-4o's TPM bucket is only 30k. At "auto" detail a page costs 1,105 image tokens, so
-# statements beyond ~15 pages would exhaust it. For those, drop to "low" detail (a flat 85
-# tokens/page, no tiling) — the native text lines carry the exact header strings and their
-# bounding boxes, so the image only needs to convey that a table is present.
-_STAGE1_LOWDETAIL_PAGE_THRESHOLD = 12
+# gpt-4o's TPM bucket is only 30k, so image detail is scaled to page count. "auto" costs
+# 1,105 tokens/page (6 tiles) and "low" a flat 85. Verified on may26_dbs.pdf that "low"
+# still yields the correct 93 rows — the text lines carry the layout signal, the image only
+# needs to confirm a table is present. Small statements keep "auto" for maximum fidelity on
+# unfamiliar bank layouts, where the token cost is irrelevant anyway.
+# Never trim text lines to save tokens: they are what determine table_bbox.
+_STAGE1_AUTODETAIL_MAX_PAGES = 6
 
 
 def _detect_layout(images: list[str], all_text_lines: list[list[dict]]) -> dict:
     """Stage 1: Vision layout detection, processed in 4-page batches.
 
-    Sends only the top 50 text lines per page (where column headers always live), which
-    keeps each 4-page batch to roughly 4x1,105 image + 4x850 text tokens (~8k) — safely
-    inside gpt-4o's 30k TPM bucket.
-    Stage 2 reads the full PDF independently, so no transaction data is affected.
+    Sends EVERY text line of each page (compactly encoded, never truncated) so the
+    returned table_bbox reaches the real bottom of the table. An 11-page DBS statement
+    costs ~17.7k tokens total, comfortably inside gpt-4o's 30k TPM bucket.
     """
     all_page_results: list[dict] = []
-    detail = "low" if len(images) > _STAGE1_LOWDETAIL_PAGE_THRESHOLD else "auto"
+    detail = "auto" if len(images) <= _STAGE1_AUTODETAIL_MAX_PAGES else "low"
 
     for batch_start in range(0, len(images), _STAGE1_BATCH_SIZE):
         batch_images = images[batch_start : batch_start + _STAGE1_BATCH_SIZE]
@@ -376,7 +396,7 @@ def _detect_layout(images: list[str], all_text_lines: list[list[dict]]) -> dict:
         for i, (img, lines) in enumerate(zip(batch_images, batch_lines), start=batch_start + 1):
             user_content.append({
                 "type": "text",
-                "text": f"=== Page {i} native text lines ===\n{json.dumps(lines[:_STAGE1_MAX_LINES], separators=(',', ':'))}",
+                "text": f"=== Page {i} native text lines ===\n{json.dumps(_slim_lines_for_stage1(lines), separators=(',', ':'))}",
             })
             user_content.append({
                 "type": "image_url",
@@ -544,9 +564,17 @@ def _extract_rows_from_page(
     # (top 35% of the page), exclude words whose bottom edge is below that bound.
     # For full-page tables Vision undershoots table_y_end (~40% of actual height),
     # so the filter is skipped to avoid truncating real transactions.
+    # This cutoff is the most destructive step in the pipeline: a bbox that is too short
+    # (as happens when Stage 1 is fed truncated text lines) silently deletes most of the
+    # page. Log whenever it fires so that shows up in the logs instead of as missing rows.
     page_height = page.rect.height
     if table_y_end is not None and page_height > 0 and table_y_end / page_height < 0.35:
-        below = [w for w in below if w[3] < table_y_end]
+        kept = [w for w in below if w[3] < table_y_end]
+        logger.info(
+            "Partial-table cutoff at y=%.1f on %.0fpt page: kept %d of %d words",
+            table_y_end, page_height, len(kept), len(below),
+        )
+        below = kept
         if not below:
             return []
 
