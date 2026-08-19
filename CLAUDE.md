@@ -141,8 +141,9 @@ id, user_id (FK → users), ticker, trade_type (BUY/SELL), quantity, price, date
 ```
 PDF Upload
     ↓
-parse_statement() → ONE call: PDF sent natively to a reasoning model (Responses API,
-                    input_file + strict json_schema) → structured JSON
+parse_statement() → ONE call: PDF sent natively to a reasoning model → structured JSON
+                    Primary: gemini-3.6-flash. Falls back to gpt-5.6-terra (OpenAI
+                    Responses API) if Gemini fails outright — see below.
     ↓
 Deduplicator → compute hash (includes reference_id), check (hash, user_id) unique, skip if exists
     ↓
@@ -159,6 +160,33 @@ The model reads the PDF directly — there is no rendering, no text extraction, 
 coordinate/layout logic. This replaced a 3-stage pipeline (Vision layout detection →
 PyMuPDF row extraction → GPT CSV structuring) whose geometry heuristics silently dropped
 transactions. `pymupdf` is no longer a dependency.
+
+### Two providers: Gemini primary, OpenAI fallback
+`parse_statement()` tries `_parse_with_gemini()` first; if it raises for any reason
+(including after Gemini's own retries are exhausted, or a truncated/incomplete response),
+it falls back to `_parse_with_openai()` — the original single-provider implementation.
+Both share the exact same `_EXTRACTION_PROMPT` and `_TRANSACTION_SCHEMA`, so accuracy is
+identical regardless of which one serves a given upload.
+
+Why: the Gemini API key is currently on the **free tier** (no Cloud Billing account
+linked), which is deprioritized under load and returns `503 UNAVAILABLE` ("high demand")
+more readily than the paid tier. The `google-genai` SDK does **not** retry transient
+errors by default — passing `HttpRetryOptions()` (even with every field left at its
+default) is required to opt into its built-in policy: 5 attempts, 1–60s exponential
+backoff with jitter, retrying `408/429/500/502/503/504`. This is already wired up in
+`_gemini_client()`. The OpenAI fallback exists as the second layer of defense on top of
+that, for whatever gets past the retries.
+
+To reduce how often the fallback fires, enable billing on the Gemini API key (a Cloud
+Billing account/card in Google Cloud Console — separate from any consumer Gemini/Google
+AI Pro subscription, which does **not** grant API access). This is an account-level
+action outside the app; no code change is needed once it's done.
+
+**`GEMINI_API_KEY` must be set wherever this runs — including Render.** If it's missing
+in production, every Gemini attempt fails immediately and every upload silently runs
+through the OpenAI fallback instead: uploads still work, but none of the cost savings
+apply, and there's no visible error unless Render logs are checked for the
+"Gemini parse failed ... falling back" warning.
 
 ### Contract — violating these silently drops rows in `app/routers/upload.py`
 - `amount` must be **positive**; `if amount <= 0: continue` discards the row with no error.
@@ -263,6 +291,7 @@ Hash: `sha256(date|description.lower()|amount:.2f|bank_source|reference_id)` —
 Local `.env`:
 ```
 OPENAI_API_KEY=your_key_here
+GEMINI_API_KEY=your_key_here          # from aistudio.google.com/apikey — primary PDF parser
 SECRET_KEY=<64 hex chars — python -c "import secrets; print(secrets.token_hex(64))">
 GOOGLE_CLIENT_ID=your_google_client_id
 GOOGLE_CLIENT_SECRET=your_google_client_secret
@@ -271,8 +300,12 @@ ENVIRONMENT=development
 
 Production (Render env vars — never in code):
 ```
-OPENAI_API_KEY, DATABASE_URL, SECRET_KEY, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, ENVIRONMENT=production
+OPENAI_API_KEY, GEMINI_API_KEY, DATABASE_URL, SECRET_KEY, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, ENVIRONMENT=production
 ```
+`GEMINI_API_KEY` is unrelated to a consumer Gemini/Google AI Pro subscription — it's a
+separate Google Cloud / AI Studio credential. See "Two providers" above: if it's absent,
+uploads still work but silently run through the (more expensive) OpenAI fallback for every
+statement.
 
 ---
 
@@ -281,7 +314,8 @@ OPENAI_API_KEY, DATABASE_URL, SECRET_KEY, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
 - [ ] `ENVIRONMENT=production` set → enables sanitized error messages, `debug=False`
 - [ ] **Enable GitHub Dependabot alerts** (Settings → Security → Dependabot) — reminder for when repo is pushed
 - [ ] **`| safe` audit** — grep all templates and confirm no user-supplied content passes through `| safe`
-- [ ] OpenAI key rotated for production (revoke dev key)
+- [ ] OpenAI and Gemini keys rotated for production (revoke dev keys)
+- [ ] Gemini API billing enabled (Cloud Billing account linked) to move off the free tier's lower-priority queue, reducing OpenAI-fallback frequency
 - [ ] All Render env vars set; no secrets in code or git
 
 ---
@@ -294,6 +328,6 @@ OPENAI_API_KEY, DATABASE_URL, SECRET_KEY, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
 - Amount values may be negative (legacy data); always use `abs()` / `|abs` filter when displaying — `type` field carries sign semantics
 - **Zombie server warning:** check for zombie uvicorn processes with `netstat -ano | findstr :8000`; kill with `Stop-Process -Id <pid> -Force`
 - `parse_statement(pdf_path, bank_source)` returns `dict`: `{"transactions": list, "closing_balance": float|None, "account_type": str|None}`. It is called from exactly one place — `app/routers/upload.py` Phase A — so the pipeline can be swapped without touching anything downstream.
-- Parser model/effort are env-overridable: `STATEMENT_PARSER_MODEL` (default `gpt-5.6-terra`), `STATEMENT_PARSER_EFFORT` (`high`), `STATEMENT_PARSER_SERVICE_TIER` (`default`). A statement takes ~90s to parse; the request timeout is 600s and `_PROCESSING_TIMEOUT` in `upload.py` is 15 min.
+- Parser config is env-overridable. Gemini (primary): `STATEMENT_PARSER_MODEL` (default `gemini-3.6-flash`), `STATEMENT_PARSER_GEMINI_THINKING` (`HIGH`). OpenAI (fallback): `STATEMENT_PARSER_FALLBACK_MODEL` (default `gpt-5.6-terra`), `STATEMENT_PARSER_FALLBACK_EFFORT` (`high`), `STATEMENT_PARSER_FALLBACK_SERVICE_TIER` (`default`). A statement takes ~90–215s to parse; `_PROCESSING_TIMEOUT` in `upload.py` is 15 min, sized to cover Gemini retries plus a full fallback attempt.
 - `batch_alter_table` in Alembic is SQLite-specific — new migrations targeting Postgres should use regular `op.add_column` etc. or check dialect
 - `DATABASE_URL` from Render starts with `postgres://` — must replace with `postgresql://` for SQLAlchemy

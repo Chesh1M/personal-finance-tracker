@@ -3,6 +3,7 @@ uvicorn[standard]
 sqlalchemy
 alembic
 openai
+google-genai
 yfinance
 jinja2
 python-multipart
